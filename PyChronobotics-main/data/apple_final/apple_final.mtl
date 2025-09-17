@@ -1,0 +1,13 @@
+# Blender 4.0.1 MTL File: 'uploads_files_4185672_banana.blend'
+# www.blender.org
+
+newmtl apple
+Ns 308.063507
+Ka 1.000000 1.000000 1.000000
+Ke 0.000000 0.000000 0.000000
+Ni 1.000000
+d 1.000000
+illum 2
+map_Kd apple_color.jpg
+map_Ks apple_specular_map.jpg
+map_Bump -bm 0.500000 apple_normal_map.jpg
