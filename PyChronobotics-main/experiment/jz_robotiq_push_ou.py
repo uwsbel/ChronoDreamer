@@ -191,9 +191,9 @@ IK_solver = RobotArmInverseKinematicsSolver('robotiq-3dof')
 # Add camera sensor --------------------------------------------------------------------
 
 lens_model = sens.PINHOLE
-update_rate = 25
-image_width = 640
-image_height = 480
+update_rate = 30
+image_width = 256
+image_height = 256
 fov = 1.408
 lag = 0
 exposure_time = 0
@@ -276,8 +276,8 @@ print(f"Logging joystick commands to: {csv_filename}")
 while vis.Run():
     sim_time = system.GetChTime()
 
-    # Exit simulation after 40 seconds
-    if sim_time >= 40.0:
+    # Exit simulation after 60 seconds
+    if sim_time >= 60.0:
         print(f"Simulation completed at {sim_time:.2f} seconds")
         break
     
