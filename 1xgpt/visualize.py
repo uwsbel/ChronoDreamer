@@ -92,7 +92,7 @@ def rescale_magvit_output(magvit_output):
     return clipped_output
 
 
-def decode_latents_wrapper(batch_size=16, tokenizer_ckpt="data/magvit2.ckpt", max_images=None):
+def decode_latents_wrapper(batch_size=16, tokenizer_ckpt="data/magvit2_fintune/checkpoints/finetuned_epoch10.ckpt", max_images=None):
     device = "cuda"
     dtype = torch.bfloat16
 

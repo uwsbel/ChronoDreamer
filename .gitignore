@@ -1,3 +1,16 @@
-1xgpt/data/*/
+1xgpt/data/genie_model/
+1xgpt/data/genie-test/
+1xgpt/data/genie_generated/
+1xgpt/data/pretrained_ckpts/
+1xgpt/data/test*
+1xgpt/data/train*
+1xgpt/data/val*
 PyChronobotics-main/exp_data/*
 test-scripts/vid-model/pretrained_ckpts/
+1xgpt/data/external_data/
+1xgpt/data/magvit2_fintune/checkpoints/
+1xgpt/data/magvit2_fintune/magvit2.ckpt
+
+venv/
+1xgpt/venv/
+1xgpt/wandb/

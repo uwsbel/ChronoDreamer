@@ -285,9 +285,9 @@ while vis.Run():
     manager.Update()
     
     # Handle pygame events and joystick input
-    if joystick and step_number % control_steps == 0:
+    if True and step_number % control_steps == 0:
         current_ou_sample = ou_process.sample()
-        pygame.event.pump()  # Update joystick state
+        #pygame.event.pump()  # Update joystick state
 
         axis_x = current_ou_sample[0]
         axis_y = current_ou_sample[1]
@@ -334,7 +334,7 @@ while vis.Run():
     
     if step_number % control_steps == 0:
         # Log joystick commands to CSV file only on control steps
-        if joystick:
+        if True:
             csv_writer.writerow([sim_time, axis_x, axis_y, axis_right_y])
             
         if sim_time > 2:  # Start joystick control after 2 seconds
@@ -365,6 +365,6 @@ csv_file.close()
 print(f"Joystick commands saved to: {csv_filename}")
 
 # Cleanup pygame when done
-if joystick:
+if True:
     pygame.joystick.quit()
 pygame.quit()

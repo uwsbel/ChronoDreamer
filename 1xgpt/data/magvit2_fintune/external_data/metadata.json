@@ -1,0 +1,13 @@
+{
+  "num_images": 1801,
+  "frame_rate": 30.0,
+  "resolution": [
+    256,
+    256
+  ],
+  "token_shape": [
+    16,
+    16
+  ],
+  "dtype": "uint32"
+}
