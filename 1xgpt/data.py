@@ -30,7 +30,7 @@ class RawTokenDataset(TorchDataset):
                 Notably, has `video.bin` and `metadata.json`
             window_size: number of frames per "video" sequence
             stride: frame skip
-            filter_interrupts: Under 3% of training frame sequences are the concatenation of two different clips.
+            filtefr_interrupts: Under 3% of training frame sequences are the concatenation of two different clips.
                 If filter_interrupts is True, will filter out these sequences using the segment ids.
             filter_overlaps: If False (default), one frame will appear in multiple examples;
                 e.g. frame 0 might appear as the first frame in example 0 and also the second frame in example 15.

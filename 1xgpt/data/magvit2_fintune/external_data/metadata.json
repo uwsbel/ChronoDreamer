@@ -5,7 +5,7 @@
     256,
     256
   ],
-  "token_shape": [
+  "latent_shape": [
     16,
     16
   ],

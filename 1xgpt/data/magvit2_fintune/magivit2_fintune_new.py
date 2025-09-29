@@ -40,7 +40,7 @@ class ImageFolderDataset(Dataset):
 # ------------------------------
 def train(
     data_dir="frames",
-    ckpt_path="checkpoints/finetuned_epoch20.ckpt",
+    ckpt_path="checkpoints/100_step_ckpt.ckpt",
     save_dir="checkpoints",
     batch_size=8,
     num_epochs=10,
@@ -81,7 +81,7 @@ def train(
     def recon_loss(recon, target):
         loss_l1 = l1_loss(recon, target)
         loss_perc = perceptual_loss(recon, target).mean()
-        return loss_l1 + 0.2 * loss_perc  # weight perceptual loss
+        return loss_l1 + 0.02 * loss_perc  # weight perceptual loss
 
     # Optimizer (only trainable params)
     optimizer = optim.AdamW(
@@ -112,8 +112,8 @@ def train(
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {avg_loss:.6f}")
 
-        # Save checkpoint every 20 epochs
-        if (epoch + 1) % 20 == 0:
+        # Save checkpoint every 10 epochs
+        if (epoch + 1) % 10 == 0:
             ckpt_out = os.path.join(save_dir, f"finetuned_epoch{epoch+1}.ckpt")
             torch.save({
                 "state_dict": model.state_dict(),
@@ -127,11 +127,11 @@ def train(
 if __name__ == "__main__":
     train(
         data_dir="exp_data",          # folder with images
-        ckpt_path="checkpoints/finetuned_epoch20.ckpt",
+        ckpt_path="checkpoints/100_step_ckpt.ckpt",
         save_dir="checkpoints",
         batch_size=6,
         num_epochs=200,
-        lr=1e-4,
+        lr=5e-5,
         device="cuda" if torch.cuda.is_available() else "cpu",
         freeze_codebook=True
     )

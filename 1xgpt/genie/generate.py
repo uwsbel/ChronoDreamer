@@ -22,7 +22,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generates samples (as tokens) from GENIE model. "
                                                  "Optionally visualizes these tokens as GIFs or comics.")
     parser.add_argument(
-        "--val_data_dir", type=str, default="data/val_v1.1",
+        "--val_data_dir", type=str, default="data/val_v3.0",
         help="A directory with video data, should have a `metadata.json` and `video.bin` We generate using the first frames of this dataset."
     )
     parser.add_argument(
