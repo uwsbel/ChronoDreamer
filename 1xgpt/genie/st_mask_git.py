@@ -62,6 +62,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         self.config = config
 
+
     def generate(
         self,
         input_ids: torch.LongTensor,
@@ -237,11 +238,51 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                                     "b (num_vocabs vocab_size) t h w -> b vocab_size num_vocabs t h w",
                                     vocab_size=self.config.factored_vocab_size,
                                     num_vocabs=self.config.num_factored_vocabs)
+        
+        print(f"\nLogits debug:")
+        print(f"  factored_logits shape: {factored_logits.shape}")
+        print(f"  factored_logits min: {factored_logits.min().item():.3f}")
+        print(f"  factored_logits max: {factored_logits.max().item():.3f}")
+        print(f"  factored_logits mean: {factored_logits.mean().item():.3f}")
+
 
         factored_targets = factorize_labels(targets_THW)
 
         loss_THW = F.cross_entropy(factored_logits, factored_targets, reduction="none").sum(dim=1)
         acc_THW = (factored_logits.argmax(dim=1) == factored_targets).all(dim=1)
+
+
+        print(f"\nTargets debug:")
+        print(f"  factored_targets shape: {factored_targets.shape}")
+        print(f"  factored_targets min: {factored_targets.min().item()}")
+        print(f"  factored_targets max: {factored_targets.max().item()}")
+        print(f"  unique targets: {torch.unique(factored_targets).shape[0]}")
+
+        # DEBUG: Print shapes and sample values
+        print(f"\n=== Loss/Accuracy Debug ===")
+        print(f"loss_THW shape: {loss_THW.shape}")
+        print(f"acc_THW shape: {acc_THW.shape}")
+        print(f"relevant_mask_THW shape: {relevant_mask_THW.shape}")
+        
+        print(f"\nLoss values (first 10 masked positions):")
+        masked_losses = loss_THW[relevant_mask_THW][:10]
+        print(f"  {masked_losses.tolist()}")
+        
+        print(f"\nAccuracy values (first 10 masked positions):")
+        masked_accs = acc_THW[relevant_mask_THW][:10]
+        print(f"  {masked_accs.tolist()}")
+        
+        print(f"\nLoss statistics:")
+        print(f"  Min loss: {loss_THW.min().item():.3f}")
+        print(f"  Max loss: {loss_THW.max().item():.3f}")
+        print(f"  Mean loss (all): {loss_THW.mean().item():.3f}")
+        print(f"  Mean loss (masked): {loss_THW[relevant_mask_THW].mean().item():.3f}")
+        
+        print(f"\nAccuracy statistics:")
+        print(f"  Correct predictions (masked): {acc_THW[relevant_mask_THW].sum().item()}")
+        print(f"  Total masked tokens: {relevant_mask_THW.sum().item()}")
+        print(f"  Accuracy (masked): {acc_THW[relevant_mask_THW].float().mean().item():.4f}")
+        
 
         # Compute the mean masked error.
         # Multiply loss values by mask instead of indexing them, more computationally efficient.
