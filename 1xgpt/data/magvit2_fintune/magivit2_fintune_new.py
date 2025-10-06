@@ -1,3 +1,4 @@
+from tqdm import tqdm
 import os
 import glob
 from pathlib import Path
@@ -40,7 +41,7 @@ class ImageFolderDataset(Dataset):
 # ------------------------------
 def train(
     data_dir="frames",
-    ckpt_path="checkpoints/100_step_ckpt.ckpt",
+    ckpt_path="magvit2.ckpt",
     save_dir="checkpoints",
     batch_size=8,
     num_epochs=10,
@@ -95,7 +96,9 @@ def train(
 
     for epoch in range(num_epochs):
         total_loss = 0
-        for imgs in dataloader:
+        progress = tqdm(dataloader, desc=f"Epoch [{epoch+1}/{num_epochs}]", ncols=100)
+
+        for imgs in progress:
             imgs = imgs.to(device)
 
             # Forward: safer to call model(imgs)
@@ -108,6 +111,7 @@ def train(
             optimizer.step()
 
             total_loss += loss.item()
+            progress.set_postfix(loss=f"{loss.item():.4f}")  # show loss live
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {avg_loss:.6f}")
@@ -127,7 +131,7 @@ def train(
 if __name__ == "__main__":
     train(
         data_dir="exp_data",          # folder with images
-        ckpt_path="checkpoints/100_step_ckpt.ckpt",
+        ckpt_path="checkpoints/finetuned_epoch90.ckpt",
         save_dir="checkpoints",
         batch_size=6,
         num_epochs=200,

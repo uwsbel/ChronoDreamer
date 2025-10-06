@@ -20,13 +20,13 @@ os.makedirs(output_dir, exist_ok=True)
 
 # Create subdirectories for different types of output
 sen_out_dir = os.path.join(output_dir, "sensor_img/")
-irr_out_dir = os.path.join(output_dir, "irr_img/")
+#irr_out_dir = os.path.join(output_dir, "irr_img/")
 os.makedirs(sen_out_dir, exist_ok=True)
-os.makedirs(irr_out_dir, exist_ok=True)
+#os.makedirs(irr_out_dir, exist_ok=True)
 
 print(f"Output directory: {output_dir}")
 print(f"Sensor images: {sen_out_dir}")
-print(f"Irrlicht images: {irr_out_dir}")
+#print(f"Irrlicht images: {irr_out_dir}")
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
@@ -257,9 +257,9 @@ desired_position = np.array([0.0, 0.6, -0.05])  # Starting position
 movement_speed = 0.0075  # m/s per control step
 
 step_number = 0
-save_img = True
+save_img = False
 render_step_size = 1.0 / 25  # FPS = 25
-control_step_size = 1.0 / 25
+control_step_size = 1.0 / 30
 render_steps = math.ceil(render_step_size / timestep)
 control_steps = math.ceil(control_step_size / timestep)
 render_frame = 0

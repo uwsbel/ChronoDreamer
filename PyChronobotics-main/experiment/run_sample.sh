@@ -1,6 +1,6 @@
 #!/bin/bash
 
-for i in $(seq 1 60); do
+for i in $(seq 1 987); do
     folder="test_$(date +%Y%m%d_%H%M%S)_$i"
     mkdir -p "$folder/sensor_img"
 
