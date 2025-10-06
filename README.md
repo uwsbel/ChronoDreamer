@@ -2,6 +2,10 @@ A world model training framework upon Chrono
 # ChronoDreamer World Model & Robotics Framework
 
 This repository provides a comprehensive framework for world model training, video tokenization, and robotics simulation, integrating state-of-the-art generative models and physical simulation environments.
+<img width="4800" height="2400" alt="media_images_vis_train_0_217000_206c6109eb0c8f29c237" src="https://github.com/user-attachments/assets/16793f01-b350-4074-967b-7b4845f6de27" />
+
+![generated_offset0(1)](https://github.com/user-attachments/assets/395be1c5-6c9f-4f3a-b93c-3a5548606722)
+
 
 ## Repository Structure
 
