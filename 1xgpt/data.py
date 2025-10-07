@@ -43,6 +43,10 @@ class RawTokenDataset(TorchDataset):
         shape = (self.metadata["num_images"], self.metadata["s"], self.metadata["s"])
         video_tokens_path, segment_ids_path, action_tokens_path = [data_dir / f"{name}.bin"
                                                                    for name in ["video", "segment_ids", "actions"]]
+        
+    
+        print(action_tokens_path)
+
         token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
         self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
         # self.actions = np.memmap(action_tokens_path, dtype=np.uint16, mode="r", shape=(self.metadata["num_images"],))
