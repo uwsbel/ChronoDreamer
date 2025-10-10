@@ -16,7 +16,7 @@ from magvit2.config import VQConfig
 # Settings
 # ---------------------------------------
 root_dir = Path("exp_data")        # experiments live here: exp_data/*/{sensor_img, joystick_commands.csv}
-ckpt_path = Path("checkpoints/finetuned_epoch90.ckpt")
+ckpt_path = Path("checkpoints/action_data_finetune.ckpt")
 resize_hw = (256, 256)
 batch_size = 8
 

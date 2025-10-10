@@ -8,10 +8,11 @@
 PyChronobotics-main/exp_data/*
 test-scripts/vid-model/pretrained_ckpts/
 1xgpt/data/external_data/
-1xgpt/data/magvit2_fintune/checkpoints/
-1xgpt/data/magvit2_fintune/magvit2.ckpt
-1xgpt/data/magvit2_fintune/exp_data
-1xgpt/data/magvit2_fintune/exp_data_10_of
+1xgpt/data/magvit2_finetune/checkpoints/
+1xgpt/data/magvit2_finetune/magvit2.ckpt
+1xgpt/data/magvit2_finetune/exp_data
+1xgpt/data/magvit2_finetune/exp_data_10_of
+1xgpt/data/magvit2_finetune/external_data/
 venv/
 1xgpt/venv/
 1xgpt/wandb/
