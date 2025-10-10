@@ -49,7 +49,9 @@ class RawTokenDataset(TorchDataset):
 
         token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
         self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
-        # self.actions = np.memmap(action_tokens_path, dtype=np.uint16, mode="r", shape=(self.metadata["num_images"],))
+        self.actions = np.memmap(action_tokens_path, dtype=np.float16, mode="r", shape=(self.metadata["num_images"], 3))
+
+        print("finished reading action data")
 
         if os.path.isfile(segment_ids_path):
             self.segment_ids = np.memmap(
