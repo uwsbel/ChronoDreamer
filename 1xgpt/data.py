@@ -49,9 +49,14 @@ class RawTokenDataset(TorchDataset):
 
         token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
         self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
-        self.actions = np.memmap(action_tokens_path, dtype=np.float16, mode="r", shape=(self.metadata["num_images"], 3))
 
-        print("finished reading action data")
+        if action_tokens_path.exists():
+            self.actions = np.memmap(action_tokens_path, dtype=np.float16, mode="r",
+                                     shape=(self.metadata["num_images"], 3))
+            print("finished reading action data")
+        else:
+            self.actions = None
+            print(f"warning: actions file not found at {action_tokens_path}; continuing without actions")
 
         if os.path.isfile(segment_ids_path):
             self.segment_ids = np.memmap(
@@ -98,17 +103,26 @@ class RawTokenDataset(TorchDataset):
     def __getitem__(self, idx):
         """
         Returns a flattened sequence of tokens representing `self.window_size` frames,
-        spaced `self.stride` apart.
+        spaced `self.stride` apart, plus action tokens if available.
         """
         start_ind = self.valid_start_inds[idx]
         x = torch.from_numpy((self.data[start_ind : start_ind + self.video_len + 1 : self.stride]).astype(np.int64))
         x = x.flatten()
 
         attention_mask = torch.ones_like(x)
+
+        # Select actions for the same frames as x
+        action_inds = range(start_ind, start_ind + self.video_len + 1, self.stride)
+        if self.actions is None:
+            actions = torch.zeros((self.window_size, 3), dtype=torch.float32)
+        else:
+            actions = torch.from_numpy(self.actions[action_inds].astype(np.float32))  # shape: (window_size, 3)
+
         return {
             "input_ids": x,
             "labels": x,
             "attention_mask": attention_mask,
+            "actions": actions,  # Add this line
         }
 
 
@@ -127,7 +141,10 @@ def get_maskgit_collator(config: GenieConfig):
         x_THWC = factorize_token_ids(x_THW, config.num_factored_vocabs, config.factored_vocab_size)
         labels = x_THW.clone()
 
-        # As done in Copilot-4D paper, add random noise sampled with a random rate between 0% and `config.max_corrupt_rate`
+        # Stack actions
+        actions = torch.stack([ex["actions"] for ex in features])  # shape: (batch, window_size, 3)
+
+        # Add random corruption as before
         r = torch.rand(x_THWC.size(), device=device)
         u01 = torch.rand((), device=device)
         random_patches_mask = r < config.max_corrupt_rate * u01
@@ -167,9 +184,17 @@ def get_maskgit_collator(config: GenieConfig):
         x_THW = unfactorize_token_ids(x_THWC, config.num_factored_vocabs, config.factored_vocab_size)
         x_THW[:, first_masked_frame:][mask] = mask_token_id
 
+        # Split actions into history and future
+        history_actions = actions[:, :first_masked_frame, :]  # shape: (batch, num_prompt_frames, 3)
+        future_actions = actions[:, first_masked_frame:, :]   # shape: (batch, num_future_frames, 3)
+
         return {
             "input_ids": rearrange(x_THW, "b t h w -> b (t h w)"),
             "labels": rearrange(labels, "b t h w -> b (t h w)"),
+            "actions": actions,  # full sequence
+            "history_actions": history_actions,
+            "future_actions": future_actions,
+            "first_masked_frame": first_masked_frame,  # for debugging/inspection
         }
 
     return collate_fn

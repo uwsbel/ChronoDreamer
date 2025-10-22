@@ -33,19 +33,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self.h = self.w = math.isqrt(config.S)
         assert self.h**2 == config.S, "Expected S to be square"
 
-        self.decoder = STTransformerDecoder(
-            num_layers=config.num_layers,
-            num_heads=config.num_heads,
-            d_model=config.d_model,
-            qkv_bias=config.qkv_bias,
-            proj_bias=config.proj_bias,
-            qk_norm=config.qk_norm,
-            use_mup=config.use_mup,
-            attn_drop=config.attn_drop,
-            mlp_ratio=config.mlp_ratio,
-            mlp_bias=config.mlp_bias,
-            mlp_drop=config.mlp_drop,
-        )
+        self.decoder = STTransformerDecoder(config)
 
         self.pos_embed_TSC = torch.nn.Parameter(torch.zeros(1, config.T, config.S, config.d_model))
         self.mask_token_id = config.image_vocab_size
@@ -59,7 +47,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         cls = FixedMuReadout if config.use_mup else nn.Linear  # (Fixed)MuReadout might slow dow down compiled training?
         self.out_x_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
-
+        
         self.config = config
 
 
@@ -67,7 +55,9 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.LongTensor,
-        max_new_tokens: int,
+        max_new_tokens: int,  # Move this BEFORE the default arguments
+        history_actions: torch.FloatTensor = None,  # Default arguments
+        future_actions: torch.FloatTensor = None,   # Default arguments
         min_new_tokens: int = None,
         return_logits: int = False,
         maskgit_steps: int = 1,
@@ -101,6 +91,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             sample_HW, factored_logits = self.maskgit_generate(
                 inputs_masked_THW,
                 timestep,
+                history_actions=history_actions,  # Add this
+                future_actions=future_actions,    # Add this
                 maskgit_steps=maskgit_steps,
                 temperature=temperature
             )
@@ -125,6 +117,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self,
         prompt_THW: torch.LongTensor,
         out_t: int,
+        history_actions: torch.FloatTensor = None,  # Add this
+        future_actions: torch.FloatTensor = None,   # Add this
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         unmask_mode: str = "random",
@@ -161,14 +155,16 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         # this will be modified in place on each iteration of this loop
         unmasked = self.init_mask(prompt_THW)
 
-        logits_CTHW = self.compute_logits(prompt_THW)
+        # Pass actions to compute_logits
+        logits_CTHW = self.compute_logits(prompt_THW, history_actions, future_actions)
         logits_CHW = logits_CTHW[:, :, out_t]
-        orig_logits_CHW = logits_CHW.clone()  # Return these original logits, not logits after partially sampling.
+        orig_logits_CHW = logits_CHW.clone()
+        
         for step in tqdm(range(maskgit_steps)):
-            # Perform a single maskgit step (cosine schedule), updating unmasked in-place
-            if step > 0:  # recompute logits with updated prompt
-                logits_CHW = self.compute_logits(prompt_THW)[:, :, out_t]
-
+            if step > 0:
+                # Pass actions here too
+                logits_CHW = self.compute_logits(prompt_THW, history_actions, future_actions)[:, :, out_t]
+        
             factored_logits = rearrange(logits_CHW, "b (num_vocabs vocab_size) h w -> b vocab_size num_vocabs h w",
                                         vocab_size=self.config.factored_vocab_size,
                                         num_vocabs=self.config.num_factored_vocabs)
@@ -293,28 +289,31 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         # only optimize on the masked/noised logits?
         return relevant_loss, relevant_acc
 
-    def compute_logits(self, x_THW):
-        # x_THW is for z0,...,zT while x_targets is z1,...,zT
-        x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
-        x_TSC = self.token_embed(x_TS)
+    def compute_logits(self, x_THW, history_actions=None, future_actions=None):
+        # x_THW: (B, T, H, W) - contains history frames + masked future frames
+        x_TS = rearrange(x_THW, "B T H W -> B T (H W)")  # (B, T, S)
+        x_TSC = self.token_embed(x_TS)  # (B, T, S, d_model)
 
-        # additive embeddings, using the same vocab space
-        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
+        # Pass separate action streams to transformer
+        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC, 
+                            history_actions=history_actions, 
+                            future_actions=future_actions)
         x_next_TSC = self.out_x_proj(x_TSC)
 
         logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
         return logits_CTHW
 
-    def forward(self, input_ids, labels):
+    def forward(self, input_ids, labels, actions=None, history_actions=None, future_actions=None, **kwargs):
         T, H, W = self.config.T, self.h, self.w
         x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
-        logits_CTHW = self.compute_logits(x_THW)
+        # Use the separated action inputs
+        logits_CTHW = self.compute_logits(x_THW, history_actions=history_actions, future_actions=future_actions)
 
         labels = rearrange(labels, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
-        # Record the loss over masked tokens only to make it more comparable to LLM baselines
-        relevant_mask = x_THW[:, 1:] == self.mask_token_id  # could also get mask of corrupted tokens by uncommenting line in `get_maskgit_collator`
+        # Record the loss over masked tokens only
+        relevant_mask = x_THW[:, 1:] == self.mask_token_id
         relevant_loss, relevant_acc = self.compute_loss_and_acc(logits_CTHW, labels, relevant_mask)
 
         return ModelOutput(loss=relevant_loss, acc=relevant_acc, logits=logits_CTHW)

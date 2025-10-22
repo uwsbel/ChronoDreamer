@@ -45,6 +45,10 @@ def parse_args():
         help="The index in the dataset of the example to generate on."
     )
     parser.add_argument(
+        "--start_frame", type=int, default=None,
+        help="Optional: explicit start frame index in the original video to use as window start. Overrides example_ind.",
+    )
+    parser.add_argument(
         "--teacher_force_time", action="store_true",
         help="If True, teacher-forces generation in time dimension."
     )
@@ -66,9 +70,14 @@ def main():
     val_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size, stride=STRIDE)
     latent_side_len = val_dataset.metadata["s"]
 
-    # Get single example
-    example_THW = val_dataset[args.example_ind]["input_ids"].reshape(1, args.window_size, latent_side_len,
-                                                                     latent_side_len).to("cuda")
+    # Get single example INCLUDING ACTIONS
+    example_data = val_dataset[args.example_ind]
+    example_THW = example_data["input_ids"].reshape(1, args.window_size, latent_side_len, latent_side_len).to("cuda")
+
+    # ✅ Extract actions from the example
+    example_actions = example_data["actions"].unsqueeze(0).to("cuda")  # (1, window_size, 3)
+    history_actions = example_actions[:, :args.num_prompt_frames, :]    # (1, num_prompt_frames, 3)
+    future_actions = example_actions[:, args.num_prompt_frames:, :]     # (1, num_future_frames, 3)
 
     # Load the model checkpoint
     model = STMaskGIT.from_pretrained(args.checkpoint_dir).to("cuda")
@@ -82,16 +91,19 @@ def main():
         # Teacher-forced, maskgit generation
         if args.teacher_force_time:
             prompt_THW = example_THW.clone()
-            # Masked prediction for this timestep only, after which we provide ground-truth
-            prompt_THW[:, timestep:] = model.image_mask_token
+            prompt_THW[:, timestep:] = model.mask_token_id
 
         samples_HW, _ = model.maskgit_generate(
-            prompt_THW, out_t=timestep, maskgit_steps=args.maskgit_steps, temperature=args.temperature,
+            prompt_THW,
+            out_t=timestep,
+            history_actions=history_actions,  # ✅ Add this
+            future_actions=future_actions,    # ✅ Add this
+            maskgit_steps=args.maskgit_steps,
+            temperature=args.temperature,
         )
 
         samples.append(samples_HW)
         if not args.teacher_force_time:
-            # autoregressive
             prompt_THW[:, timestep] = samples_HW
 
     outputs = torch.stack(samples, dim=1)

@@ -102,7 +102,7 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=4,
+        default=6,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
@@ -270,8 +270,23 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         num_prompt_frames = window_size // 2  # hardcoding half of frames for context
         num_new_tokens = latent_side_len ** 2 * (window_size - num_prompt_frames)
         prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
-        outputs = unwrapped_model.generate(input_ids=prompt_input_ids, attention_mask=torch.ones_like(prompt_input_ids),
-                                           max_new_tokens=num_new_tokens, min_new_tokens=num_new_tokens)
+        
+        # Extract actions if available
+        history_actions = None
+        future_actions = None
+        if "history_actions" in batch and "future_actions" in batch:
+            history_actions = batch["history_actions"][:4].to(accelerator.device)
+            future_actions = batch["future_actions"][:4].to(accelerator.device)
+        
+        outputs = unwrapped_model.generate(
+            input_ids=prompt_input_ids, 
+            attention_mask=torch.ones_like(prompt_input_ids),
+            history_actions=history_actions,  # Add this
+            future_actions=future_actions,    # Add this
+            max_new_tokens=num_new_tokens, 
+            min_new_tokens=num_new_tokens
+        )
+        
         output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=window_size,
                                   h=latent_side_len, w=latent_side_len)
         gtruth_tokens = rearrange(reshaped_labels[:, num_prompt_frames:], "b t (h w) -> b t h w",
