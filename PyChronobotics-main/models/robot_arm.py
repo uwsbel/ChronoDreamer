@@ -136,6 +136,10 @@ class RobotiqGripper:
     def move_linear_motor(self, motor, pos):
         motor.SetMotionFunction(chrono.ChFunctionConst(pos))
 
+    def get_bodies_of_interest(self):
+        return [self.finger_1, self.finger_2, self.endoffactor, self.elbow, self.shoulder]   
+
+
 
     def add_object(self, object_name):
         self.objects.append(object_name)
