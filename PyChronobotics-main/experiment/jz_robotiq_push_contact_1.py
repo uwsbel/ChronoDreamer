@@ -638,7 +638,7 @@ joint_angles_writer.writerow(['sim_time', 'theta_0', 'theta_1', 'theta_2', 'thet
 print(f"Logging joint angles to: {joint_angles_filename}")
 
 
-
+system.SetNumThreads(6)
 
 while vis.Run():
     sim_time = system.GetChTime()

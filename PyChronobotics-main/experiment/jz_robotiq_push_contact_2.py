@@ -454,7 +454,7 @@ gripper.add_object("soda_can_2")
 soda_can_3 = assets_importer.sodacan(chrono.ChVector3d(0.2, 0.75, 0.06),collidable=True)
 gripper.add_object("soda_can_3")
 soda_can_4 = assets_importer.sodacan(chrono.ChVector3d(-0.2, 0.74, 0.06),collidable=True)
-gripper.add_object("soda_can_0")
+gripper.add_object("soda_can_4")
 
 
 # add item of interest to list
@@ -643,7 +643,7 @@ joint_angles_writer.writerow(['sim_time', 'theta_0', 'theta_1', 'theta_2', 'thet
 
 print(f"Logging joint angles to: {joint_angles_filename}")
 
-
+system.SetNumThreads(8)
 
 
 while vis.Run():
