@@ -8,6 +8,7 @@ sys.path.append(project_root)
 # Add the parent directory of 'models' to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+
 class AssetsImporter:
     """
     A helper class to import various assets (ball, box, cylinder, table, mug, etc.) into the Chrono system.
@@ -86,8 +87,10 @@ class AssetsImporter:
         else:
             contact_material = chrono.ChContactMaterialSMC()
 
+        contact_material.SetKn(2e9)
 
-        table = chrono.ChBodyEasyMesh(self.project_root + '/data/test_objs/table_scaled.obj', # mesh filename
+
+        table = chrono.ChBodyEasyMesh(self.project_root + '/data/test_objs/table_re.obj', # mesh filename
                                     3000,             # density kg/m^3
                                     True,             # automatically compute mass and inertia
                                     True,             # visualize?>
@@ -95,13 +98,14 @@ class AssetsImporter:
                                     contact_material, # contact material
                                     )
         table.SetPos(position)
-        table.SetRot(chrono.Q_ROTATE_Y_TO_X)
+        table.SetRot(chrono.QuatFromAngleAxis(3.1415926,chrono.ChVector3d(1,0,0)) * chrono.Q_ROTATE_Y_TO_X )
         # assign a wood like color
         table.GetVisualShape(0).SetColor(chrono.ChColor(0.8, 0.52, 0.25))
         self.system.Add(table)
+        return table
 
     
-    def box(self, dimension = [1,1,1], position=chrono.ChVector3d(0, 0, 0), rot = chrono.Q_ROTATE_Y_TO_Z, collidable=True):
+    def box(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01):
         """Import a box asset into the system, formed by a mesh loaded from a file.
         
         Args:
@@ -110,22 +114,43 @@ class AssetsImporter:
             rot (chrono.ChQuaternion): The rotation of the box.
             collidable (bool): Flag to enable collision for the box."""
         
+        # if self.system.GetContactMethod() == 0:
+        #     box_material = chrono.ChContactMaterialNSC()
+        # else:
+        #     box_material = chrono.ChContactMaterialSMC()
+
+        # box_material.SetKn(2e7)
+        # box = chrono.ChBodyEasyBox(dimension[0],dimension[1],dimension[2], 1000, True, True, box_material)
+        # box.GetVisualShape(0).SetTexture(chrono.GetChronoDataFile("textures/bluewhite.png"))
+        # box.SetName("box")
+        # box.SetPos(position)
+        # box.SetRot(rot)
+        # box.SetFixed(False)
+        # box.EnableCollision(True)
+        # self.system.Add(box)
+        # return box
+
+
         if self.system.GetContactMethod() == 0:
-            box_material = chrono.ChContactMaterialNSC()
+            contact_material = chrono.ChContactMaterialNSC()
         else:
-            box_material = chrono.ChContactMaterialSMC()
+            contact_material = chrono.ChContactMaterialSMC()
 
-        box_material.SetKn(2e7)
-        box = chrono.ChBodyEasyBox(dimension[0],dimension[1],dimension[2], 1000, True, True, box_material)
-        box.GetVisualShape(0).SetTexture(chrono.GetChronoDataFile("textures/bluewhite.png"))
-        box.SetName("box")
-        box.SetPos(position)
-        box.SetRot(rot)
-        box.SetFixed(False)
-        box.EnableCollision(True)
-        self.system.Add(box)
-        return box
+        contact_material.SetRollingFriction(rolling_friction)
+        contact_material.SetKn(2e8)
 
+
+        gcone = chrono.ChBodyEasyMesh(self.project_root + '/data/box_final/sub_0.5.obj', # mesh filename
+                                    1000,             # density kg/m^3
+                                    True,             # automatically compute mass and inertia
+                                    True,             # visualize?>
+                                    True,             # collide?
+                                    contact_material, # contact material
+                                    )
+        gcone.SetPos(position)
+        #gcone.GetVisualShape(0).SetColor(chrono.ChColor(0.2, 0.6, 0.2))
+        self.system.Add(gcone)
+        return gcone
 
     def flashlight(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01):
         """Import a green cone asset into the system, formed by a mesh loaded from a file. Note that the cone's collision shape is a cylinder.
@@ -141,6 +166,7 @@ class AssetsImporter:
             contact_material = chrono.ChContactMaterialSMC()
 
         contact_material.SetRollingFriction(rolling_friction)
+        contact_material.SetKn(2e8)
 
 
         gcone = chrono.ChBodyEasyMesh(self.project_root + '/data/flashlight_final/flashlight_final.obj', # mesh filename
@@ -153,6 +179,7 @@ class AssetsImporter:
         gcone.SetPos(position)
         gcone.GetVisualShape(0).SetColor(chrono.ChColor(0.2, 0.6, 0.2))
         self.system.Add(gcone)
+        return gcone
 
 
     # You can add more asset-loading functions similarly
