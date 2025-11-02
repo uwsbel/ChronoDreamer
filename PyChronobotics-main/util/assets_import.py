@@ -8,6 +8,7 @@ sys.path.append(project_root)
 # Add the parent directory of 'models' to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+
 class AssetsImporter:
     """
     A helper class to import various assets (ball, box, cylinder, table, mug, etc.) into the Chrono system.

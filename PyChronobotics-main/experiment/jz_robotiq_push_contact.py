@@ -8,6 +8,95 @@ import os
 import numpy as np
 import argparse
 
+cam_pos_global = None
+system_global = None
+
+class RayCaster:
+
+    def __init__(self, sys, origin, dims, spacing):
+        self.m_sys = system_global
+        self.m_origin = origin
+        self.m_dims = dims
+        self.m_spacing = spacing
+        self.m_points = []
+        
+    # def Update(self):
+    #     """Cast rays from camera to contact point origin"""
+    #     m_points = []
+        
+    #     # Direction from camera to contact point
+    #     contact_pos = self.m_origin.GetPos()
+    #     direc = contact_pos - cam_pos_global
+    #     direc_length = chrono.ChVector3d(direc).Length()
+        
+    #     # Normalize direction
+    #     if direc_length > 0:
+    #         direc = direc / direc_length
+    #     else:
+    #         print("Warning: Camera and contact point are at same location")
+    #         return m_points
+        
+    #     nx = round(self.m_dims[0]/self.m_spacing)
+    #     ny = round(self.m_dims[1]/self.m_spacing)
+        
+    #     for ix in range(nx):
+    #         for iy in range(ny):
+    #             x_local = -0.5 * self.m_dims[0] + ix * self.m_spacing
+    #             y_local = -0.5 * self.m_dims[1] + iy * self.m_spacing
+                
+    #             # Ray origin in world coordinates
+    #             from_vec = self.m_origin.TransformPointLocalToParent(chrono.ChVector3d(x_local, y_local, 0.0))
+                
+    #             # Ray end point (slightly beyond contact point to ensure we capture it)
+    #             to = from_vec + direc * (direc_length + 0.1)
+                
+    #             # Perform ray casting
+    #             result = chrono.ChRayhitResult()
+    #             self.m_sys.GetCollisionSystem().RayHit(from_vec, to, result)
+                
+    #             # Check if ray hit something
+    #             if result.hit:
+    #                 m_points.append(result.abs_hitPoint)
+                    
+    #                 # Optional: Check if there's an obstruction between camera and contact
+    #                 hit_distance = chrono.ChVector3d(result.abs_hitPoint - cam_pos_global).Length()
+    #                 if hit_distance < direc_length - 0.01:  # 1cm tolerance
+    #                     print(f"Obstruction detected at distance {hit_distance:.3f}m (contact at {direc_length:.3f}m)")
+        
+    #     self.m_points = m_points
+    #     return m_points
+    
+    def has_clear_line_of_sight(self):
+        """Check if there's a clear line of sight from camera to contact point"""
+        contact_pos = self.m_origin.GetPos()
+        direc = contact_pos - cam_pos_global
+        direc_length = direc.Length()
+        
+        if direc_length == 0:
+            return False
+        
+        # Single ray from camera to contact point
+        result = chrono.ChRayhitResult()
+
+        print("contact pos:", contact_pos.x, contact_pos.y, contact_pos.z)
+        print("cam pos:", cam_pos_global.x, cam_pos_global.y, cam_pos_global.z)
+
+        coll = self.m_sys.GetCollisionSystem()
+        self.m_sys.GetCollisionSystem().RayHit(cam_pos_global, contact_pos, result)
+        
+        if result.hit:
+            # Check if hit point is very close to contact point (allowing small tolerance)
+            hit_distance = chrono.ChVector3d(result.abs_hitPoint - cam_pos_global).Length()
+            tolerance = 0.05  # 5cm tolerance
+            
+            if abs(hit_distance - direc_length) < tolerance:
+                return True  # Clear line of sight
+            else:
+                return False  # Something is blocking
+        
+        return True  # No hit means clear path
+# ==================================================================================================
+
 class CameraPoseLogger:
     def __init__(self, output_dir=None):
         self.output_dir = output_dir
@@ -85,43 +174,61 @@ class ContactReporter (chrono.ReportContactCallback):
                 break
 
         if has_A and has_B:
-            self.contact_count += 1  # Increment counter
+            # Store all contacts without filtering
+            self.contact_count += 1
             
-            # Store contact data
+            # Store contact data with position for later filtering
             contact_data = {
                 'pA': (pA.x, pA.y, pA.z),
-                'frc': (frc.x, frc.y, frc.z)
+                'frc': (frc.x, frc.y, frc.z),
             }
-            self.contacts_data.append(contact_data)
             
-            #print("   contact on pA:    ", pA.x, pA.y, pA.z)
-            print("   frc:              ", frc.x, frc.y, frc.z)
+            self.contacts_data.append(contact_data)
+            print(f"   Contact recorded at ({pA.x:.3f}, {pA.y:.3f}, {pA.z:.3f})")
             
         return True
     
     def write_contacts_to_csv(self, sim_time):
-        """Write all collected contacts to a new CSV file for this frame"""
+        """Write all collected contacts to a new CSV file for this frame, filtering by line of sight"""
         if self.output_dir:
             # Create filename with zero-padded frame number
             csv_filename = os.path.join(self.contacts_dir, f"contact_{self.frame_number:04d}.csv")
+            
+            # Filter contacts by line of sight
+            visible_contacts = []
+            for contact in self.contacts_data:
+                #caster = RayCaster(
+                #    self.items_of_interest[0].GetSystem(),
+                #    chrono.ChFramed(chrono.ChVector3d(contact['pA'][0], contact['pA'][1], contact['pA'][2]), 
+                #                    chrono.QuatFromAngleX(-chrono.CH_PI_2)), 
+                #    [2.5, 2.5], 
+                #    0.02
+                #)
+                
+
+                #if caster.has_clear_line_of_sight():
+                if True:  # Temporarily disable occlusion filtering
+                    visible_contacts.append(contact)
+                else:
+                    print(f"   Contact at ({contact['pA'][0]:.3f}, {contact['pA'][1]:.3f}, {contact['pA'][2]:.3f}) OCCLUDED - filtered out")
             
             with open(csv_filename, 'w', newline='') as f:
                 writer = csv.writer(f)
                 # Write header
                 writer.writerow(['sim_time', 'pA_x', 'pA_y', 'pA_z', 
                                'frc_x', 'frc_y', 'frc_z'])
-                # Write all contacts for this frame (empty if no contacts)
-                for contact in self.contacts_data:
+                # Write only visible contacts
+                for contact in visible_contacts:
                     writer.writerow([
                         sim_time,
                         contact['pA'][0], contact['pA'][1], contact['pA'][2],
                         contact['frc'][0], contact['frc'][1], contact['frc'][2]
                     ])
             
-            if self.contacts_data:
-                print(f"Saved {len(self.contacts_data)} contacts to {csv_filename}")
+            if visible_contacts:
+                print(f"Saved {len(visible_contacts)} visible contacts (out of {len(self.contacts_data)} total) to {csv_filename}")
             else:
-                print(f"Saved empty contact file (no contacts) to {csv_filename}")
+                print(f"Saved empty contact file ({len(self.contacts_data)} contacts were occluded) to {csv_filename}")
         
         # Increment frame number for next file
         self.frame_number += 1
@@ -150,12 +257,16 @@ os.makedirs(output_dir, exist_ok=True)
 
 # Create subdirectories for different types of output
 sen_out_dir = os.path.join(output_dir, "sensor_img/")
+sen_out_dir_1 = os.path.join(output_dir, "sensor_img_1/")
+sen_out_dir_2 = os.path.join(output_dir, "sensor_img_2/")
 #irr_out_dir = os.path.join(output_dir, "irr_img/")
 os.makedirs(sen_out_dir, exist_ok=True)
+os.makedirs(sen_out_dir_1, exist_ok=True)
 #os.makedirs(irr_out_dir, exist_ok=True)
 
 print(f"Output directory: {output_dir}")
 print(f"Sensor images: {sen_out_dir}")
+print(f"Sensor images 1: {sen_out_dir_1}")
 #print(f"Irrlicht images: {irr_out_dir}")
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -259,6 +370,9 @@ floor.GetVisualShape(0).SetColor(chrono.ChColor(0.5, 0.2, .8))
 
 system.Add(floor)
 
+#system.SetSolverType(chrono.ChSolver.Type_BARZILAIBORWEIN) # precise, more slow
+#system.GetSolver().AsIterative().SetMaxIterations(30)
+
 # Create Warehouse --------------------------------------------------------------------
 # Load and add the warehouse mesh
 mmesh = chrono.ChTriangleMeshConnected()
@@ -277,6 +391,8 @@ mesh_body.AddVisualShape(trimesh_shape)
 mesh_body.SetFixed(True)
 mesh_body.EnableCollision(False)
 system.Add(mesh_body)
+
+system_global = system
 
 # initialize the assets importer
 assets_importer = AssetsImporter(system)
@@ -344,6 +460,8 @@ robotiq_items_of_interest = gripper.get_bodies_of_interest()
 for item in robotiq_items_of_interest:
     items_of_interest.append(item)
 
+
+
 # Initialize contact reporter ------------------------------------------------------
 contact_reporter = ContactReporter(items_of_interest, output_dir)
 
@@ -401,6 +519,61 @@ cam.PushFilter(sens.ChFilterSave(sen_out_dir))
 
 manager.AddSensor(cam) # Turned off
 
+rotation_4 = chrono.QuatFromAngleZ(chrono.CH_PI*1.2)
+rotation_5 = chrono.QuatFromAngleY(chrono.CH_PI/3)
+offset_pose_1 = chrono.ChFramed(
+        chrono.ChVector3d(0.32, 0.9, 1.6), rotation_4 * rotation_5)
+
+cam_1 = sens.ChCameraSensor(
+    floor,              # body camera is attached to
+    update_rate,            # update rate in Hz
+    offset_pose_1,            # offset pose
+    image_width,            # image width
+    image_height,           # image height
+    fov                     # camera's horizontal field of view
+)
+
+cam_1.SetName("Camera Sensor 1")
+cam_1.SetLag(lag)
+cam_1.SetCollectionWindow(exposure_time)
+cam_1.PushFilter(sens.ChFilterVisualize(
+    image_width, image_height, "Arm Camera 1"))
+cam_1.PushFilter(sens.ChFilterRGBA8Access())
+cam_1.PushFilter(sens.ChFilterSave(sen_out_dir_1))
+
+manager.AddSensor(cam_1) # Turned off
+
+
+## ============================
+rotation_6 = chrono.QuatFromAngleZ(chrono.CH_PI*-0.2)
+rotation_7 = chrono.QuatFromAngleY(chrono.CH_PI/3)
+offset_pose_2 = chrono.ChFramed(
+        chrono.ChVector3d(-0.32, 0.9, 1.6), rotation_6* rotation_7)
+cam_2 = sens.ChCameraSensor(
+    floor,              # body camera is attached to
+    update_rate,            # update rate in Hz
+    offset_pose_2,            # offset pose
+    image_width,            # image width
+    image_height,           # image height
+    fov                     # camera's horizontal field of view
+)
+
+cam_2.SetName("Camera Sensor 2")
+cam_2.SetLag(lag)
+cam_2.SetCollectionWindow(exposure_time)
+cam_2.PushFilter(sens.ChFilterVisualize(
+    image_width, image_height, "Arm Camera 2"))
+cam_2.PushFilter(sens.ChFilterRGBA8Access())
+cam_2.PushFilter(sens.ChFilterSave(sen_out_dir_2))
+
+manager.AddSensor(cam_2) # Turned off
+
+## ===============================
+
+
+
+
+
 ### Simulation Setup
 # Irrlicht Visualization
 vis = chronoirr.ChVisualSystemIrrlicht(system)
@@ -445,6 +618,17 @@ csv_writer.writerow(['sim_time', 'axis_x', 'axis_y', 'axis_right_y'])  # Header 
 
 print(f"Logging joystick commands to: {csv_filename}")
 
+
+joint_angles_filename = os.path.join(output_dir, "joint_angles.csv")
+joint_angles_file = open(joint_angles_filename, 'w', newline='')
+joint_angles_writer = csv.writer(joint_angles_file)
+joint_angles_writer.writerow(['sim_time', 'theta_0', 'theta_1', 'theta_2', 'theta_3'])  # Header row
+
+print(f"Logging joint angles to: {joint_angles_filename}")
+
+
+
+
 while vis.Run():
     sim_time = system.GetChTime()
 
@@ -460,6 +644,24 @@ while vis.Run():
 
     # Handle pygame events and joystick input
     if True and step_number % control_steps == 0:
+        # Get camera pos and rot in world frame
+        cam_offset_pose = cam.GetOffsetPose()
+        cam_parent = cam.GetParent()
+        cam_parent_pos = cam_parent.GetPos()
+        cam_parent_rot = cam_parent.GetRot()
+
+        cam_pos_world = cam_parent_pos + cam_parent_rot.Rotate(cam_offset_pose.GetPos())
+        cam_rot_world = cam_parent_rot * cam_offset_pose.GetRot()
+
+        print(f"Camera Position (world): {cam_pos_world.x:.3f}, {cam_pos_world.y:.3f}, {cam_pos_world.z:.3f}")
+        print(f"Camera Rotation (world): {cam_rot_world.e0:.3f}, {cam_rot_world.e1:.3f}, {cam_rot_world.e2:.3f}, {cam_rot_world.e3:.3f}")
+
+        cam_pos_global = cam_pos_world
+
+        # Log camera pose to CSV
+        camera_logger.log_camera_pose(sim_time, cam_pos_world, cam_rot_world)
+
+
        # Reset counter before checking contacts
         contact_reporter.reset_contact_count()
         
@@ -476,20 +678,6 @@ while vis.Run():
             print(f"Time {sim_time:.3f}s - Valid contacts: {num_contacts}")
 
 
-        # Get camera pos and rot in world frame
-        cam_offset_pose = cam.GetOffsetPose()
-        cam_parent = cam.GetParent()
-        cam_parent_pos = cam_parent.GetPos()
-        cam_parent_rot = cam_parent.GetRot()
-
-        cam_pos_world = cam_parent_pos + cam_parent_rot.Rotate(cam_offset_pose.GetPos())
-        cam_rot_world = cam_parent_rot * cam_offset_pose.GetRot()
-
-        print(f"Camera Position (world): {cam_pos_world.x:.3f}, {cam_pos_world.y:.3f}, {cam_pos_world.z:.3f}")
-        print(f"Camera Rotation (world): {cam_rot_world.e0:.3f}, {cam_rot_world.e1:.3f}, {cam_rot_world.e2:.3f}, {cam_rot_world.e3:.3f}")
-
-        # Log camera pose to CSV
-        camera_logger.log_camera_pose(sim_time, cam_pos_world, cam_rot_world)
 
         current_ou_sample = ou_process.sample()
         #pygame.event.pump()  # Update joystick state
@@ -558,6 +746,9 @@ while vis.Run():
                 gripper.rotate_motor(gripper.motor_biceps_elbow, final_theta[2])
                 gripper.rotate_motor(gripper.motor_elbow_wrist, final_theta[3])
                 prev_control_command = final_theta
+
+                 # Log joint angles to CSV
+                joint_angles_writer.writerow([sim_time, final_theta[0], final_theta[1], final_theta[2], final_theta[3]])
                 
             except ValueError as e:
                 print(f"IK solver failed: {e}")
@@ -567,7 +758,9 @@ while vis.Run():
 
 # Close CSV file when done
 csv_file.close()
+joint_angles_file.close()
 print(f"Joystick commands saved to: {csv_filename}")
+print(f"Joint angles saved to: {joint_angles_filename}")
 
 # Cleanup pygame when done
 if True:

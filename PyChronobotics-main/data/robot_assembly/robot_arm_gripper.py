@@ -134,7 +134,7 @@ body_4.AddVisualShape(body_4_1_shape, chrono.ChFramed(chrono.ChVector3d(0,0,0), 
 
 # Collision shape
 contact_material = chrono.ChContactMaterialSMC()
-body_4.AddCollisionShape(chrono.ChCollisionShapeBox(contact_material,0.05,0.03,0.05))
+body_4.AddCollisionShape(chrono.ChCollisionShapeBox(contact_material,0.055,0.08,0.055), chrono.ChFramed(chrono.ChVector3d(0, -0.03, 0), chrono.QUNIT))
 body_4.EnableCollision(True)
 body_4.GetCollisionModel().SetFamily(3)
 body_4.GetCollisionModel().DisallowCollisionsWith(2)

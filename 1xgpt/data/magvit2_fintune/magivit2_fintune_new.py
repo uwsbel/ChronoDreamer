@@ -82,7 +82,7 @@ def train(
     def recon_loss(recon, target):
         loss_l1 = l1_loss(recon, target)
         loss_perc = perceptual_loss(recon, target).mean()
-        return loss_l1 + 0.02 * loss_perc  # weight perceptual loss
+        return loss_l1 + 0.1 * loss_perc  # weight perceptual loss
 
     # Optimizer (only trainable params)
     optimizer = optim.AdamW(
@@ -117,7 +117,7 @@ def train(
         print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {avg_loss:.6f}")
 
         # Save checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 2 == 0:
             ckpt_out = os.path.join(save_dir, f"finetuned_epoch{epoch+1}.ckpt")
             torch.save({
                 "state_dict": model.state_dict(),
@@ -130,12 +130,12 @@ def train(
 
 if __name__ == "__main__":
     train(
-        data_dir="exp_data",          # folder with images
-        ckpt_path="checkpoints/finetuned_epoch90.ckpt",
+        data_dir="nov1sample",          # folder with images
+        ckpt_path="checkpoints/magvit2.ckpt",
         save_dir="checkpoints",
-        batch_size=6,
-        num_epochs=200,
-        lr=5e-5,
+        batch_size=7,
+        num_epochs=100,
+        lr=1e-4,
         device="cuda" if torch.cuda.is_available() else "cpu",
         freeze_codebook=True
     )

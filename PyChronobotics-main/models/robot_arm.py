@@ -50,7 +50,7 @@ class RobotiqGripper:
         self.finger_1.GetVisualShape(0).SetColor(chrono.ChColor(0.5, 0.5, 0.5))
         self.finger_2.GetVisualShape(0).SetColor(chrono.ChColor(0.5, 0.5, 0.5))
 
-        self.wrist.EnableCollision(True)
+        self.wrist.EnableCollision(False)
 
         # create name for each marker
         self.joint_base_shoulder = self.system.SearchMarker("MARKER_1")
@@ -107,6 +107,8 @@ class RobotiqGripper:
         # self.joint_wrist_endoffactor.SetPos(pos)
         # self.joint_endoffactor_finger.SetPos(pos)
 
+        #self.endoffactor.GetCollisionModel().Clear() 
+
         self.objects = list()
         self.gripper_on = False
         self.cur_lock = None
@@ -119,6 +121,8 @@ class RobotiqGripper:
         self.gripper_left_or_right = True
         self.flag = False
         self.lock_flag = False
+
+
 
         
     def rotate_motor(self, motor, angle):
@@ -280,6 +284,8 @@ class RobotMoveo:
         self.finger_1 = self.system.SearchBody("finger-1")
         self.finger_2 = self.system.SearchBody("finger-2")
 
+        self.endoffactor.GetCollisionModel().ClearModel() 
+
         # Add NSC contact materials to gripper fingers
         #if self.system.GetContactMethod() == chrono.ChContactMethod_NSC:
             # Create NSC contact material
@@ -304,6 +310,8 @@ class RobotMoveo:
         #            # Enable collision for fingers specifically
         #            if body == self.finger_1 or body == self.finger_2:
         #                body.EnableCollision(True)
+
+
 
 
         # create name for each marker
