@@ -185,3 +185,62 @@ class AssetsImporter:
     # You can add more asset-loading functions similarly
 
 
+    def sodacan(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01):
+        """Import a soda can asset into the system, formed by a mesh loaded from a file. Note that the can's collision shape is a cylinder.
+        while the visualization is a mesh.
+        
+        Args:
+            position (chrono.ChVector3d): The position of the soda can.
+            collidable (bool): Flag to enable collision for the soda can."""
+        # initialize soda can visual shape
+        if self.system.GetContactMethod() == 0:
+            contact_material = chrono.ChContactMaterialNSC()
+        else:
+            contact_material = chrono.ChContactMaterialSMC()
+
+        contact_material.SetRollingFriction(rolling_friction)
+        contact_material.SetKn(5e9)
+
+        gsodacan = chrono.ChBodyEasyMesh(self.project_root + '/data/soda_can/soda_can.obj', # mesh filename
+                                    1000,             # density kg/m^3
+                                    True,             # automatically compute mass and inertia
+                                    True,             # visualize?
+                                    True,             # collide?
+                                    contact_material, # contact material
+                                    )
+        gsodacan.SetPos(position)
+        gsodacan.GetVisualShape(0).SetColor(chrono.ChColor(0.2, 0.6, 0.2))
+        print("soda can mass: ", gsodacan.GetMass())
+        self.system.Add(gsodacan)
+        return gsodacan
+
+
+
+    def waterbottle(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01):
+        """Import a water bottle asset into the system, formed by a mesh loaded from a file. Note that the bottle's collision shape is a cylinder.
+        while the visualization is a mesh.
+        
+        Args:
+            position (chrono.ChVector3d): The position of the water bottle.
+            collidable (bool): Flag to enable collision for the water bottle."""
+        # initialize water bottle visual shape
+        if self.system.GetContactMethod() == 0:
+            contact_material = chrono.ChContactMaterialNSC()
+        else:
+            contact_material = chrono.ChContactMaterialSMC()
+
+        contact_material.SetRollingFriction(rolling_friction)
+        contact_material.SetKn(5e9)
+
+        gwaterbottle = chrono.ChBodyEasyMesh(self.project_root + '/data/water_bottle/water_bottle.obj', # mesh filename
+                                    1200,             # density kg/m^3
+                                    True,             # automatically compute mass and inertia
+                                    True,             # visualize?
+                                    True,             # collide?
+                                    contact_material, # contact material
+                                    )
+        gwaterbottle.SetPos(position)
+        gwaterbottle.GetVisualShape(0).SetColor(chrono.ChColor(0.2, 0.6, 0.2))
+        print("water bottle mass: ", gwaterbottle.GetMass())
+        self.system.Add(gwaterbottle)
+        return gwaterbottle

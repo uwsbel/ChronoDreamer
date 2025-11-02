@@ -1,0 +1,12 @@
+# Blender 4.0.1 MTL File: 'None'
+# www.blender.org
+
+newmtl Cola
+Ka 1.000000 1.000000 1.000000
+Ks 0.500000 0.500000 0.500000
+Ke 0.000000 0.000000 0.000000
+Ni 1.500000
+d 1.000000
+illum 2
+map_Kd 34b58f732bca3e8f97d6152d0a377cdf.jpg
+map_Ns COLA_Normal.png
