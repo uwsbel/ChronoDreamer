@@ -10,10 +10,14 @@ class GenieConfig:
     num_heads: int
     d_model: int
     T: int = 16  # temporal sequence length
-    S: int = 256  # spatial sequence length, e.g. 256 for 16x16
-    image_vocab_size: int = 262144  # image_vocab_size: number of distinct image tokens;
+    S: int = 1024  # spatial sequence length, e.g. 32x32
+    image_vocab_size: int = 65536  # image_vocab_size: number of distinct image tokens;
     # actual model vocab size is larger to include special (e.g. mask) tokens.
     use_mup: bool = False
+
+    # Contact prediction
+    contact_vocab_size: int = 65536  # vocab size for contact tokens (adjust if different)
+    contact_loss_weight: float = 4.0  # weight for contact prediction loss
 
     # Factorization for large vocabs (e.g. Open-MAGVIT2)
     num_factored_vocabs: int = 1

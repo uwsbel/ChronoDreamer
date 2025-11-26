@@ -50,6 +50,15 @@ class RawTokenDataset(TorchDataset):
         token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
         self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
 
+        # Load contact.bin with same shape as video.bin
+        contact_tokens_path = data_dir / "contact_splat.bin"  # Changed from "contact.bin"
+        if contact_tokens_path.exists():
+            self.contact = np.memmap(contact_tokens_path, dtype=token_dtype, mode="r", shape=shape)
+            print("finished reading contact data")
+        else:
+            self.contact = None
+            print(f"warning: contact file not found at {contact_tokens_path}; continuing without contact")
+
         if action_tokens_path.exists():
             self.actions = np.memmap(action_tokens_path, dtype=np.float16, mode="r",
                                      shape=(self.metadata["num_images"], 3))
@@ -111,6 +120,15 @@ class RawTokenDataset(TorchDataset):
 
         attention_mask = torch.ones_like(x)
 
+        # Load contact data for the same frames
+        if self.contact is not None:
+            contact = torch.from_numpy((self.contact[start_ind : start_ind + self.video_len + 1 : self.stride]).astype(np.int64))
+
+            contact = contact.flatten()
+
+        else:
+            contact = torch.zeros_like(x)
+
         # Select actions for the same frames as x
         action_inds = range(start_ind, start_ind + self.video_len + 1, self.stride)
         if self.actions is None:
@@ -122,7 +140,8 @@ class RawTokenDataset(TorchDataset):
             "input_ids": x,
             "labels": x,
             "attention_mask": attention_mask,
-            "actions": actions,  # Add this line
+            "actions": actions,
+            "contact": contact,  # Add contact data
         }
 
 
@@ -140,6 +159,11 @@ def get_maskgit_collator(config: GenieConfig):
                           h=h, w=w)
         x_THWC = factorize_token_ids(x_THW, config.num_factored_vocabs, config.factored_vocab_size)
         labels = x_THW.clone()
+
+        # Stack contact data
+        contact_ids = torch.stack([ex["contact"] for ex in features])
+        contact_THW = rearrange(contact_ids, "b (t h w) -> b t h w", b=len(features), t=config.T,
+                                h=h, w=w)
 
         # Stack actions
         actions = torch.stack([ex["actions"] for ex in features])  # shape: (batch, window_size, 3)
@@ -188,9 +212,13 @@ def get_maskgit_collator(config: GenieConfig):
         history_actions = actions[:, :first_masked_frame, :]  # shape: (batch, num_prompt_frames, 3)
         future_actions = actions[:, first_masked_frame:, :]   # shape: (batch, num_future_frames, 3)
 
+        # Pass full contact sequence - loss will be computed only on masked positions
+        # (no need to slice here, the model handles it via relevant_mask)
+
         return {
             "input_ids": rearrange(x_THW, "b t h w -> b (t h w)"),
             "labels": rearrange(labels, "b t h w -> b (t h w)"),
+            "contact_labels": rearrange(contact_THW, "b t h w -> b (t h w)"),  # full sequence
             "actions": actions,  # full sequence
             "history_actions": history_actions,
             "future_actions": future_actions,

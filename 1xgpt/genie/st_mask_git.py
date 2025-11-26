@@ -45,8 +45,12 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             mask_token_id=self.mask_token_id,
         )
 
-        cls = FixedMuReadout if config.use_mup else nn.Linear  # (Fixed)MuReadout might slow dow down compiled training?
+        cls = FixedMuReadout if config.use_mup else nn.Linear
         self.out_x_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
+        
+        # Contact prediction head
+        contact_vocab_size = getattr(config, 'contact_vocab_size', config.image_vocab_size)
+        self.out_contact_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
         
         self.config = config
 
@@ -55,11 +59,12 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.LongTensor,
-        max_new_tokens: int,  # Move this BEFORE the default arguments
-        history_actions: torch.FloatTensor = None,  # Default arguments
-        future_actions: torch.FloatTensor = None,   # Default arguments
+        max_new_tokens: int,
+        history_actions: torch.FloatTensor = None,
+        future_actions: torch.FloatTensor = None,
         min_new_tokens: int = None,
         return_logits: int = False,
+        return_contact: bool = False,  # NEW: option to return contact predictions
         maskgit_steps: int = 1,
         temperature: float = 0.0,
     ) -> tuple[torch.LongTensor, torch.FloatTensor]:
@@ -67,10 +72,11 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         Args designed to match the format of Llama.
         We ignore `attention_mask`, and use `max_new_tokens` to determine the number of frames to generate.
 
-        Returns: `(sample_THW, factored_logits)` if `return_logits` else `sample_THW`
-            sample_THW: size (B, num_new_frames * H * W) corresponding to autoregressively generated
-                unfactorized token ids for future frames.
-            Optionally, factored_logits: size (B, factored_vocab_size, num_factored_vocabs, num_new_frames, H, W).
+        Returns: 
+            If return_contact:
+                (video_tokens, contact_tokens) or (video_tokens, contact_tokens, factored_logits)
+            Else:
+                video_tokens or (video_tokens, factored_logits)
         """
         assert min_new_tokens in (None, max_new_tokens), \
             "Expecting `min_new_tokens`, if specified, to match `max_new_tokens`."
@@ -91,19 +97,111 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             sample_HW, factored_logits = self.maskgit_generate(
                 inputs_masked_THW,
                 timestep,
-                history_actions=history_actions,  # Add this
-                future_actions=future_actions,    # Add this
+                history_actions=history_actions,
+                future_actions=future_actions,
                 maskgit_steps=maskgit_steps,
                 temperature=temperature
             )
             inputs_masked_THW[:, timestep] = sample_HW
             all_factored_logits.append(factored_logits)
 
-        predicted_tokens = rearrange(inputs_masked_THW, "B T H W -> B (T H W)")
-        if return_logits:
-            return predicted_tokens, torch.stack(all_factored_logits, dim=3)  # (b, factored_vocab_size, num_factored_vocabs, num_new_frames, h, w)
+        predicted_video_tokens = rearrange(inputs_masked_THW, "B T H W -> B (T H W)")
+        
+        # Generate contact predictions if requested
+        contact_tokens = None
+        if return_contact:
+            contact_tokens = self.generate_contact(
+                inputs_masked_THW, 
+                history_actions=history_actions,
+                future_actions=future_actions,
+                num_prompt_frames=inputs_THW.size(1),
+                temperature=temperature
+            )
+        
+        # Return based on options
+        if return_contact:
+            if return_logits:
+                return predicted_video_tokens, contact_tokens, torch.stack(all_factored_logits, dim=3)
+            else:
+                return predicted_video_tokens, contact_tokens
         else:
-            return predicted_tokens
+            if return_logits:
+                return predicted_video_tokens, torch.stack(all_factored_logits, dim=3)
+            else:
+                return predicted_video_tokens
+
+    @torch.no_grad()
+    def generate_contact(
+        self,
+        video_THW: torch.LongTensor,
+        history_actions: torch.FloatTensor = None,
+        future_actions: torch.FloatTensor = None,
+        num_prompt_frames: int = None,
+        temperature: float = 0.0,
+    ) -> torch.LongTensor:
+        """
+        Generate contact predictions given ONLY the history video tokens.
+        Future frames are masked to match training distribution.
+        
+        Args:
+            video_THW: (B, T, H, W) - full video sequence (prompt + generated)
+            num_prompt_frames: number of prompt/history frames
+            
+        Returns:
+            contact_tokens: (B, num_future_frames, H, W) - predicted contact for future frames
+        """
+        bs, t, h, w = video_THW.shape
+        num_future_frames = t - num_prompt_frames
+        
+        # MASK future frames - contact prediction should only use history tokens!
+        # This matches training where future frames are masked
+        video_THW_masked = video_THW.clone()
+        video_THW_masked[:, num_prompt_frames:] = self.mask_token_id
+        
+        # Get hidden states from the transformer (using masked input)
+        x_TS = rearrange(video_THW_masked, "B T H W -> B T (H W)")
+        x_TSC = self.token_embed(x_TS)
+        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC,
+                            history_actions=history_actions,
+                            future_actions=future_actions)
+        
+        # Get contact logits
+        contact_logits_TSC = self.out_contact_proj(x_TSC)
+        contact_logits_CTHW = rearrange(contact_logits_TSC, "B T (H W) C -> B C T H W", H=h, W=w)
+        
+        # Only take future frames
+        contact_logits_future = contact_logits_CTHW[:, :, num_prompt_frames:]  # (B, C, num_future, H, W)
+        
+        # Convert logits to tokens (greedy or sampled)
+        factored_logits = rearrange(
+            contact_logits_future,
+            "b (num_vocabs vocab_size) t h w -> b vocab_size num_vocabs t h w",
+            vocab_size=self.config.factored_vocab_size,
+            num_vocabs=self.config.num_factored_vocabs
+        )
+        
+        # Sample or argmax for each position
+        contact_tokens = torch.zeros((bs, num_future_frames, h, w), dtype=torch.long, device=video_THW.device)
+        
+        for t_idx in range(num_future_frames):
+            frame_logits = factored_logits[:, :, :, t_idx]  # (B, vocab_size, num_vocabs, H, W)
+            frame_probs = torch.nn.functional.softmax(frame_logits, dim=1)
+            
+            samples_HW = torch.zeros((bs, h, w), dtype=torch.long, device=video_THW.device)
+            for probs in frame_probs.flip(2).unbind(2):  # iterate over factored vocabs
+                if temperature <= 1e-8:
+                    sample = probs.argmax(dim=1)
+                else:
+                    dist = torch.distributions.categorical.Categorical(
+                        probs=rearrange(probs, "b vocab_size h w -> b h w vocab_size") / temperature
+                    )
+                    sample = dist.sample()
+                samples_HW *= self.config.factored_vocab_size
+                samples_HW += sample
+            
+            contact_tokens[:, t_idx] = samples_HW
+        
+        return contact_tokens
 
     @staticmethod
     def init_mask(prompt_THW):
@@ -235,14 +333,12 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                                     vocab_size=self.config.factored_vocab_size,
                                     num_vocabs=self.config.num_factored_vocabs)
         
-        print(f"\nLogits debug:")
-        print(f"  factored_logits shape: {factored_logits.shape}")
-        print(f"  factored_logits min: {factored_logits.min().item():.3f}")
-        print(f"  factored_logits max: {factored_logits.max().item():.3f}")
-        print(f"  factored_logits mean: {factored_logits.mean().item():.3f}")
-
-
-        factored_targets = factorize_labels(targets_THW)
+        # FIX: Pass config values instead of using defaults
+        factored_targets = factorize_labels(
+            targets_THW, 
+            num_factored_vocabs=self.config.num_factored_vocabs,
+            factored_vocab_size=self.config.factored_vocab_size
+        )
 
         loss_THW = F.cross_entropy(factored_logits, factored_targets, reduction="none").sum(dim=1)
         acc_THW = (factored_logits.argmax(dim=1) == factored_targets).all(dim=1)
@@ -289,6 +385,73 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         # only optimize on the masked/noised logits?
         return relevant_loss, relevant_acc
 
+    def compute_contact_loss_and_acc(self, logits_CTHW, targets_THW, relevant_mask_THW):
+        """
+        Compute contact prediction loss using Focal Loss for sparse/imbalanced data.
+        logits_CTHW: (B, C, T-1, H, W) - logits for future frames
+        targets_THW: (B, T-1, H, W) - contact labels for future frames
+        relevant_mask_THW: (B, T-1, H, W) - mask indicating which tokens were masked
+        """
+        
+         # DEBUG: Check input BEFORE factorization
+        stats = (int(targets_THW.min()), int(targets_THW.max()), len(torch.unique(targets_THW)))
+        print(f"[Contact] BEFORE factorize: shape={targets_THW.shape}, min/max/unique={stats}", flush=True)
+        factored_logits = rearrange(logits_CTHW,
+                                    "b (num_vocabs vocab_size) t h w -> b vocab_size num_vocabs t h w",
+                                    vocab_size=self.config.factored_vocab_size,
+                                    num_vocabs=self.config.num_factored_vocabs)
+        
+        factored_targets = factorize_labels(
+            targets_THW, 
+            num_factored_vocabs=self.config.num_factored_vocabs,
+            factored_vocab_size=self.config.factored_vocab_size
+        )
+
+        factored_stats = (int(factored_targets.min()), int(factored_targets.max()), len(torch.unique(factored_targets)))
+        print(f"[Contact] AFTER factorize: shape={factored_targets.shape}, min/max/unique={factored_stats}", flush=True)
+
+        # Focal Loss: (1 - p_t)^gamma * CE
+        # gamma=2.0 focuses more on hard examples (non-black contact regions)
+        gamma = 0.0
+        ce_loss = F.cross_entropy(factored_logits, factored_targets, reduction="none")  # (B, num_vocabs, T-1, H, W)
+        p_t = torch.exp(-ce_loss)  # probability of correct class
+        focal_weight = (1 - p_t) ** gamma
+        focal_loss = focal_weight * ce_loss
+        loss_THW = focal_loss.sum(dim=1)  # sum over num_vocabs dimension
+        
+        acc_THW = (factored_logits.argmax(dim=1) == factored_targets).all(dim=1)
+
+        print(f"\n=== [Contact] Loss/Accuracy Debug (Focal Loss gamma={gamma}) ===")
+        print(f"loss_THW shape: {loss_THW.shape}")
+        print(f"acc_THW shape: {acc_THW.shape}")
+        print(f"relevant_mask_THW shape: {relevant_mask_THW.shape}")
+
+        print(f"\n[Contact] Loss values (first 10 masked positions):")
+        masked_losses = loss_THW[relevant_mask_THW][:10]
+        print(f"  {masked_losses.tolist()}")
+
+        print(f"\n[Contact] Accuracy values (first 10 masked positions):")
+        masked_accs = acc_THW[relevant_mask_THW][:10]
+        print(f"  {masked_accs.tolist()}")
+
+        print(f"\n[Contact] Loss statistics:")
+        print(f"  Min loss: {loss_THW.min().item():.3f}")
+        print(f"  Max loss: {loss_THW.max().item():.3f}")
+        print(f"  Mean loss (all): {loss_THW.mean().item():.3f}")
+        print(f"  Mean loss (masked): {loss_THW[relevant_mask_THW].mean().item():.3f}")
+
+        print(f"\n[Contact] Accuracy statistics:")
+        print(f"  Correct predictions (masked): {acc_THW[relevant_mask_THW].sum().item()}")
+        print(f"  Total masked tokens: {relevant_mask_THW.sum().item()}")
+        print(f"  Accuracy (masked): {acc_THW[relevant_mask_THW].float().mean().item():.4f}")
+
+        # Compute the mean masked error
+        num_masked_tokens = torch.sum(relevant_mask_THW)
+        relevant_loss = torch.sum(loss_THW * relevant_mask_THW) / num_masked_tokens
+        relevant_acc = torch.sum(acc_THW * relevant_mask_THW).float() / num_masked_tokens
+
+        return relevant_loss, relevant_acc
+
     def compute_logits(self, x_THW, history_actions=None, future_actions=None):
         # x_THW: (B, T, H, W) - contains history frames + masked future frames
         x_TS = rearrange(x_THW, "B T H W -> B T (H W)")  # (B, T, S)
@@ -303,20 +466,60 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
         return logits_CTHW
 
-    def forward(self, input_ids, labels, actions=None, history_actions=None, future_actions=None, **kwargs):
+    def forward(self, input_ids, labels, actions=None, history_actions=None, future_actions=None, 
+                contact_labels=None, **kwargs):  # Changed from future_contact to contact_labels
         T, H, W = self.config.T, self.h, self.w
         x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
-        # Use the separated action inputs
-        logits_CTHW = self.compute_logits(x_THW, history_actions=history_actions, future_actions=future_actions)
+        # Use the separated action inputs - get hidden states
+        x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
+        x_TSC = self.token_embed(x_TS)
+        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC, 
+                            history_actions=history_actions, 
+                            future_actions=future_actions)
+        
+        # Video prediction logits
+        video_logits_TSC = self.out_x_proj(x_TSC)
+        logits_CTHW = rearrange(video_logits_TSC, "B T (H W) C -> B C T H W", H=H, W=W)
 
         labels = rearrange(labels, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
         # Record the loss over masked tokens only
         relevant_mask = x_THW[:, 1:] == self.mask_token_id
-        relevant_loss, relevant_acc = self.compute_loss_and_acc(logits_CTHW, labels, relevant_mask)
+        video_loss, video_acc = self.compute_loss_and_acc(logits_CTHW, labels, relevant_mask)
 
-        return ModelOutput(loss=relevant_loss, acc=relevant_acc, logits=logits_CTHW)
+        # Contact prediction loss (only computed on masked positions via relevant_mask)
+        contact_loss = torch.tensor(0.0, device=input_ids.device)
+        contact_acc = torch.tensor(0.0, device=input_ids.device)
+        if contact_labels is not None:
+            # Contact logits for all frames
+            contact_logits_TSC = self.out_contact_proj(x_TSC)
+            contact_logits_CTHW = rearrange(contact_logits_TSC, "B T (H W) C -> B C T H W", H=H, W=W)
+            
+            # Extract frames 1: onwards (same as video loss) - shape: (B, C, T-1, H, W)
+            contact_logits_future = contact_logits_CTHW[:, :, 1:]
+            
+            # Reshape full contact labels: (B, T*H*W) -> (B, T, H, W) -> (B, T-1, H, W)
+            contact_labels_THW = rearrange(contact_labels, "B (T H W) -> B T H W", T=T, H=H, W=W)
+            contact_labels_future = contact_labels_THW[:, 1:]  # frames 1 to T-1
+            
+            # Compute contact loss only on masked positions (relevant_mask handles this)
+            contact_loss, contact_acc = self.compute_contact_loss_and_acc(
+                contact_logits_future, contact_labels_future, relevant_mask
+            )
+        
+        # Combine losses
+        contact_weight = getattr(self.config, 'contact_loss_weight', 1.0)
+        total_loss = video_loss + contact_weight * contact_loss
+
+        return ModelOutput(
+            loss=total_loss, 
+            video_loss=video_loss,
+            contact_loss=contact_loss,
+            acc=video_acc,
+            contact_acc=contact_acc,
+            logits=logits_CTHW
+        )
 
     def init_weights(self):
         """ Works with and without muP. """
@@ -342,7 +545,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         base_model = STMaskGIT(base_config)
 
         mup.set_base_shapes(self, base_model, rescale_params=rescale_params)
-
+        
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         """ Extra logic for muP. """

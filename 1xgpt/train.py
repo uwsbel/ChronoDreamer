@@ -102,7 +102,7 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=6,
+        default=2,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
@@ -197,7 +197,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=str,
-        default="1000",
+        default="10000",
         help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
     )
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
@@ -258,14 +258,14 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
     decode_latents = decode_latents_wrapper()  # re-initializing every time to save memory
     if accelerator.is_main_process:
         lpips_alex = lpips.LPIPS(net="alex")  # Calculate LPIPS w/ AlexNet, the fastest option
-        metrics = {"ar_lpips": []}
+        metrics = {"ar_lpips": [], "ar_contact_lpips": []}
 
     latent_side_len = metadata["s"]
 
     unwrapped_model.eval()
     for step, batch in enumerate(dataloader):
         # Note: hardcoding 4 image cap for faster inference on small models
-        reshaped_labels = rearrange(batch["labels"][:4], "b (t s) -> b t s", t=window_size).to(accelerator.device)  # `s` is really `(h, w)`
+        reshaped_labels = rearrange(batch["labels"][:4], "b (t s) -> b t s", t=window_size).to(accelerator.device)
 
         num_prompt_frames = window_size // 2  # hardcoding half of frames for context
         num_new_tokens = latent_side_len ** 2 * (window_size - num_prompt_frames)
@@ -274,20 +274,25 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         # Extract actions if available
         history_actions = None
         future_actions = None
-        if "history_actions" in batch and "future_actions" in batch:
-            history_actions = batch["history_actions"][:4].to(accelerator.device)
-            future_actions = batch["future_actions"][:4].to(accelerator.device)
+        if "actions" in batch:
+            # Use full actions and re-slice to match our num_prompt_frames
+            full_actions = batch["actions"][:4].to(accelerator.device)  # (4, window_size, 3)
+            history_actions = full_actions[:, :num_prompt_frames, :]
+            future_actions = full_actions[:, num_prompt_frames:, :]
         
-        outputs = unwrapped_model.generate(
+        # Generate video and contact predictions
+        video_outputs, contact_outputs = unwrapped_model.generate(
             input_ids=prompt_input_ids, 
             attention_mask=torch.ones_like(prompt_input_ids),
-            history_actions=history_actions,  # Add this
-            future_actions=future_actions,    # Add this
+            history_actions=history_actions,
+            future_actions=future_actions,
             max_new_tokens=num_new_tokens, 
-            min_new_tokens=num_new_tokens
+            min_new_tokens=num_new_tokens,
+            return_contact=True,  # NEW: request contact predictions
         )
         
-        output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=window_size,
+        # Process video tokens
+        output_tokens = rearrange(video_outputs, "b (t h w) -> b t h w", t=window_size,
                                   h=latent_side_len, w=latent_side_len)
         gtruth_tokens = rearrange(reshaped_labels[:, num_prompt_frames:], "b t (h w) -> b t h w",
                                   h=latent_side_len, w=latent_side_len)
@@ -298,32 +303,98 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         decoded_output = accelerator.gather(decoded_output.to(accelerator.device)).cpu()
         decoded_gtruth = accelerator.gather(decoded_gtruth.to(accelerator.device)).cpu()
 
+        # Process contact tokens
+        has_contact = "contact_labels" in batch and contact_outputs is not None
+        if has_contact:
+            # Ground truth contact - reshape and take future frames
+            contact_labels = batch["contact_labels"][:4].to(accelerator.device)
+            contact_labels_THW = rearrange(contact_labels, "b (t h w) -> b t h w", 
+                                           t=window_size, h=latent_side_len, w=latent_side_len)
+            gtruth_contact_tokens = contact_labels_THW[:, num_prompt_frames:]  # future frames only
+            
+            # Predicted contact is already (B, num_future, H, W)
+            pred_contact_tokens = contact_outputs.to(accelerator.device)
+            
+            # ============ ADD THIS DEBUG ============
+            print(f"\n=== VISUALIZATION Contact Debug ===")
+            print(f"GT tokens - min: {gtruth_contact_tokens.min()}, max: {gtruth_contact_tokens.max()}, unique: {len(torch.unique(gtruth_contact_tokens))}")
+            print(f"Pred tokens - min: {pred_contact_tokens.min()}, max: {pred_contact_tokens.max()}, unique: {len(torch.unique(pred_contact_tokens))}")
+            
+            # Check if predictions are all the same or very low values
+            if len(torch.unique(pred_contact_tokens)) < 10:
+                print(f"WARNING: Pred tokens have very few unique values!")
+                print(f"  Unique values: {torch.unique(pred_contact_tokens).tolist()[:20]}")
+            # ========================================
+            
+
+
+            # Decode contact (same decoder as video)
+            decoded_contact_output = decode_tokens(pred_contact_tokens.cpu(), decode_latents)
+            decoded_contact_gtruth = decode_tokens(gtruth_contact_tokens.cpu(), decode_latents)
+            
+            decoded_contact_output = accelerator.gather(decoded_contact_output.to(accelerator.device)).cpu()
+            decoded_contact_gtruth = accelerator.gather(decoded_contact_gtruth.to(accelerator.device)).cpu()
+
         if accelerator.is_main_process:
             exs_per_fig = 4
+            num_future_frames = window_size - num_prompt_frames
+            
             for j in range(0, len(decoded_output), exs_per_fig):
-                fig, axs = plt.subplots(nrows=2 * exs_per_fig, ncols=window_size, figsize=(3 * window_size, 3 * 2 * exs_per_fig))
-                # If len(decoded_output) is not a multiple of 4, make sure to truncate properly
+                # 4 rows per example: video GT, video pred, contact GT, contact pred
+                nrows = 4 * exs_per_fig if has_contact else 2 * exs_per_fig
+                fig, axs = plt.subplots(nrows=nrows, ncols=window_size, 
+                                        figsize=(3 * window_size, 3 * nrows))
+                
                 for k in range(min(exs_per_fig, len(decoded_output) - j)):
+                    row_offset = k * 4 if has_contact else k * 2
+                    
+                    # === VIDEO ROWS ===
+                    # Context frames (same for both video rows)
                     for i in range(num_prompt_frames):
-                        for ax in (axs[k * 2, i], axs[k * 2 + 1, i]):
-                            ax.imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
-                            ax.set_title("Context")
-                            ax.axis("off")
+                        for row in range(2):
+                            axs[row_offset + row, i].imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
+                            axs[row_offset + row, i].set_title("Context" if row == 0 else "")
+                            axs[row_offset + row, i].axis("off")
 
+                    # Future video frames
                     for i in range(num_prompt_frames, window_size):
-                        axs[k * 2, i].imshow(transforms_f.to_pil_image(decoded_gtruth[j + k, i - num_prompt_frames]))
-                        axs[k * 2, i].set_title("Ground truth")
-                        axs[k * 2 + 1, i].imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
-                        axs[k * 2 + 1, i].set_title("Prediction")
-                        for ax in axs[:, i]:
-                            ax.axis("off")
+                        axs[row_offset, i].imshow(transforms_f.to_pil_image(decoded_gtruth[j + k, i - num_prompt_frames]))
+                        axs[row_offset, i].set_title("GT Video")
+                        axs[row_offset, i].axis("off")
+                        
+                        axs[row_offset + 1, i].imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
+                        axs[row_offset + 1, i].set_title("Pred Video")
+                        axs[row_offset + 1, i].axis("off")
+                    
+                    # === CONTACT ROWS ===
+                    if has_contact:
+                        # Empty cells for context columns
+                        for i in range(num_prompt_frames):
+                            for row in range(2, 4):
+                                axs[row_offset + row, i].axis("off")
+                        
+                        # Future contact frames
+                        for i in range(num_prompt_frames, window_size):
+                            frame_idx = i - num_prompt_frames
+                            
+                            axs[row_offset + 2, i].imshow(transforms_f.to_pil_image(decoded_contact_gtruth[j + k, frame_idx]))
+                            axs[row_offset + 2, i].set_title("GT Contact")
+                            axs[row_offset + 2, i].axis("off")
+                            
+                            axs[row_offset + 3, i].imshow(transforms_f.to_pil_image(decoded_contact_output[j + k, frame_idx]))
+                            axs[row_offset + 3, i].set_title("Pred Contact")
+                            axs[row_offset + 3, i].axis("off")
 
                 wandb_tracker = accelerator.get_tracker("wandb")
                 wandb_tracker.log({f"vis_{metrics_prefix}_{j}": fig}, commit=False)
                 plt.close(fig)
 
-            metrics["ar_lpips"].extend(compute_lpips(decoded_gtruth,  # Note: not parallelizing right now
+            # Compute metrics
+            metrics["ar_lpips"].extend(compute_lpips(decoded_gtruth,
                                                      decoded_output[:, num_prompt_frames:], lpips_alex))
+            if has_contact:
+                metrics["ar_contact_lpips"].extend(compute_lpips(decoded_contact_gtruth,
+                                                                 decoded_contact_output, lpips_alex))
 
         if step + 1 >= max_steps:
             break

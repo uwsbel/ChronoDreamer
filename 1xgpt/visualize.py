@@ -92,42 +92,36 @@ def rescale_magvit_output(magvit_output):
     return clipped_output
 
 
-def decode_latents_wrapper(batch_size=16, tokenizer_ckpt="data/magvit2_finetune/checkpoints/action_data_finetune.ckpt", max_images=None):
+def decode_latents_wrapper(batch_size=16, tokenizer_ckpt="cosmos/Cosmos-Tokenizer/pretrained_ckpts/Cosmos-0.1-Tokenizer-DI8x8", max_images=None):
+    import sys
+    sys.path.append("cosmos/Cosmos-Tokenizer")
+    from cosmos_tokenizer.image_lib import ImageTokenizer
+    
     device = "cuda"
     dtype = torch.bfloat16
-
-    model_config = VQConfig()
-    model = VQModel(model_config, ckpt_path=tokenizer_ckpt)
-    model = model.to(device=device, dtype=dtype)
-    state = torch.load(tokenizer_ckpt, map_location=device)
-    if "state_dict" in state:
-        model.load_state_dict(state["state_dict"], strict=False)
-    else:
-        model.load_state_dict(state, strict=False)
-
+    
+    enc_ckpt = os.path.join(tokenizer_ckpt, "encoder.jit")
+    dec_ckpt = os.path.join(tokenizer_ckpt, "decoder.jit")
+    
+    decoder = ImageTokenizer(
+        checkpoint_dec=dec_ckpt,
+        device=device,
+        dtype="bfloat16",
+    )
 
     @torch.no_grad()
     def decode_latents(video_data):
         """
-        video_data: (b, h, w), where b is different from training/eval batch size.
+        video_data: (b, h, w), where h=32, w=32 for Cosmos DI8x8
         """
         decoded_imgs = []
 
         for shard_ind in range(math.ceil(len(video_data) / batch_size)):
             batch = torch.from_numpy(video_data[shard_ind * batch_size: (shard_ind + 1) * batch_size].astype(np.int64))
             
-            # Convert token IDs back to quantized latents
-            # Step 1: Convert indices to bits using corrected indices_to_bits
-            bits = model.quantize.indices_to_bits(batch.flatten())
-            # Step 2: Reshape to match original quantized shape
-            bits = bits.view(batch.shape[0], batch.shape[1], batch.shape[2], model.quantize.codebook_dim)
-            # Step 3: Convert bits to quantized values (-1 or 1)
-            quant = bits.float() * 2.0 - 1.0
-            # Step 4: Reshape to (B, C, H, W) format
-            quant = quant.permute(0, 3, 1, 2)
-
-            recon = model.decode(quant.to(device=device, dtype=dtype))
-            recon_scaled_batch = rescale_magvit_output(recon)  # (B, 3, 256, 256)
+            # Cosmos decoder expects (B, H, W) indices
+            recon = decoder.decode(batch.to(device=device))  # Returns (B, 3, 256, 256) in [-1, 1]
+            recon_scaled_batch = rescale_magvit_output(recon)  # (B, 3, 256, 256) uint8
 
             decoded_imgs.append(recon_scaled_batch)
 
