@@ -1,0 +1,4 @@
+python encode_di8x8_from_mp4.py     --video contact.mp4     --model_name Cosmos-0.1-Tokenizer-DI8x8     --ckpt_dir pretrained_ckpts     --out_tokens test_di8x8_tokens.npz
+
+python decode_di8x8_to_mp4.py     --tokens test_di8x8_tokens.npz     --model_name Cosmos-0.1-Tokenizer-DI8x8     --ckpt_dir pretrained_ckpts     --out_video recon_test_di8x8.mp4
+

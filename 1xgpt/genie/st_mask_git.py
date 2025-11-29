@@ -35,24 +35,61 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         self.decoder = STTransformerDecoder(config)
 
-        self.pos_embed_TSC = torch.nn.Parameter(torch.zeros(1, config.T, config.S, config.d_model))
+        # Position embeddings: S+1 to include action token per frame
+        self.pos_embed_TSC = torch.nn.Parameter(
+            torch.zeros(1, config.T, config.S + 1, config.d_model)
+        )
         self.mask_token_id = config.image_vocab_size
 
-        self.token_embed = FactorizedEmbedding(  # also works for num_factored_vocabs = 1
+        self.token_embed = FactorizedEmbedding(
             factored_vocab_size=config.factored_vocab_size,
             num_factored_vocabs=config.num_factored_vocabs,
             d_model=config.d_model,
             mask_token_id=self.mask_token_id,
         )
 
+        # Action embedding with proper scaling
+        # Actions are 3 floats - normalize and project to d_model
+        self.action_embed = nn.Sequential(
+            nn.Linear(3, config.d_model),
+            nn.LayerNorm(config.d_model),  # Ensures similar scale to token embeddings
+        )
+
         cls = FixedMuReadout if config.use_mup else nn.Linear
         self.out_x_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
         
-        # Contact prediction head
-        contact_vocab_size = getattr(config, 'contact_vocab_size', config.image_vocab_size)
         self.out_contact_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
         
         self.config = config
+
+    def embed_with_actions(
+        self, 
+        x_TS: torch.LongTensor, 
+        actions: torch.FloatTensor
+    ) -> torch.FloatTensor:
+        """
+        Embed video tokens and prepend action token to each frame.
+        
+        Args:
+            x_TS: (B, T, S) - video token ids
+            actions: (B, T, 3) - action vectors for ALL frames
+            
+        Returns:
+            x_TSC: (B, T, S+1, d_model) - with action as first token per frame
+        """
+        B, T, S = x_TS.shape
+        
+        # Embed video tokens: (B, T, S, d_model)
+        video_emb = self.token_embed(x_TS)
+        
+        # Embed and normalize actions: (B, T, d_model)
+        action_emb = self.action_embed(actions)
+        action_emb = action_emb.unsqueeze(2)  # (B, T, 1, d_model)
+        
+        # Concatenate: [action, video_tokens] for each frame
+        x_TSC = torch.cat([action_emb, video_emb], dim=2)  # (B, T, S+1, d_model)
+        
+        return x_TSC
 
 
     def generate(
@@ -60,45 +97,39 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         input_ids: torch.LongTensor,
         attention_mask: torch.LongTensor,
         max_new_tokens: int,
-        history_actions: torch.FloatTensor = None,
-        future_actions: torch.FloatTensor = None,
+        actions: torch.FloatTensor = None,  # Changed: full actions sequence
         min_new_tokens: int = None,
         return_logits: int = False,
-        return_contact: bool = False,  # NEW: option to return contact predictions
+        return_contact: bool = False,
         maskgit_steps: int = 1,
         temperature: float = 0.0,
     ) -> tuple[torch.LongTensor, torch.FloatTensor]:
-        """
-        Args designed to match the format of Llama.
-        We ignore `attention_mask`, and use `max_new_tokens` to determine the number of frames to generate.
-
-        Returns: 
-            If return_contact:
-                (video_tokens, contact_tokens) or (video_tokens, contact_tokens, factored_logits)
-            Else:
-                video_tokens or (video_tokens, factored_logits)
-        """
-        assert min_new_tokens in (None, max_new_tokens), \
-            "Expecting `min_new_tokens`, if specified, to match `max_new_tokens`."
-
-        assert max_new_tokens % self.config.S == 0, "Expecting `max_new_tokens` to be a multiple of `self.config.S`."
+        """..."""
+        assert min_new_tokens in (None, max_new_tokens)
+        assert max_new_tokens % self.config.S == 0
         num_new_frames = max_new_tokens // self.config.S
 
         inputs_THW = rearrange(input_ids.clone(), "b (t h w) -> b t h w", h=self.h, w=self.w)
+        num_prompt_frames = inputs_THW.size(1)
+        
         inputs_masked_THW = torch.cat([
             inputs_THW,
             torch.full((input_ids.size(0), num_new_frames, self.h, self.w),
                        self.mask_token_id, dtype=torch.long, device=input_ids.device)
         ], dim=1)
 
+        # Handle missing actions
+        total_frames = inputs_masked_THW.size(1)
+        if actions is None:
+            actions = torch.zeros(input_ids.size(0), total_frames, 3, 
+                                  device=input_ids.device, dtype=torch.float32)
+
         all_factored_logits = []
-        for timestep in range(inputs_THW.size(1), inputs_THW.size(1) + num_new_frames):
-            # could change sampling hparams
+        for timestep in range(num_prompt_frames, total_frames):
             sample_HW, factored_logits = self.maskgit_generate(
                 inputs_masked_THW,
                 timestep,
-                history_actions=history_actions,
-                future_actions=future_actions,
+                actions=actions,  # Pass full actions
                 maskgit_steps=maskgit_steps,
                 temperature=temperature
             )
@@ -107,18 +138,15 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         predicted_video_tokens = rearrange(inputs_masked_THW, "B T H W -> B (T H W)")
         
-        # Generate contact predictions if requested
         contact_tokens = None
         if return_contact:
             contact_tokens = self.generate_contact(
                 inputs_masked_THW, 
-                history_actions=history_actions,
-                future_actions=future_actions,
-                num_prompt_frames=inputs_THW.size(1),
+                actions=actions,
+                num_prompt_frames=num_prompt_frames,
                 temperature=temperature
             )
         
-        # Return based on options
         if return_contact:
             if return_logits:
                 return predicted_video_tokens, contact_tokens, torch.stack(all_factored_logits, dim=3)
@@ -134,45 +162,35 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
     def generate_contact(
         self,
         video_THW: torch.LongTensor,
-        history_actions: torch.FloatTensor = None,
-        future_actions: torch.FloatTensor = None,
+        actions: torch.FloatTensor = None,  # Changed: full actions
         num_prompt_frames: int = None,
         temperature: float = 0.0,
     ) -> torch.LongTensor:
-        """
-        Generate contact predictions given ONLY the history video tokens.
-        Future frames are masked to match training distribution.
-        
-        Args:
-            video_THW: (B, T, H, W) - full video sequence (prompt + generated)
-            num_prompt_frames: number of prompt/history frames
-            
-        Returns:
-            contact_tokens: (B, num_future_frames, H, W) - predicted contact for future frames
-        """
+        """Generate contact predictions."""
         bs, t, h, w = video_THW.shape
         num_future_frames = t - num_prompt_frames
         
-        # MASK future frames - contact prediction should only use history tokens!
-        # This matches training where future frames are masked
+        # Handle missing actions
+        if actions is None:
+            actions = torch.zeros(bs, t, 3, device=video_THW.device, dtype=torch.float32)
+        
+        # MASK future video frames
         video_THW_masked = video_THW.clone()
         video_THW_masked[:, num_prompt_frames:] = self.mask_token_id
         
-        # Get hidden states from the transformer (using masked input)
         x_TS = rearrange(video_THW_masked, "B T H W -> B T (H W)")
-        x_TSC = self.token_embed(x_TS)
-        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC,
-                            history_actions=history_actions,
-                            future_actions=future_actions)
         
-        # Get contact logits
-        contact_logits_TSC = self.out_contact_proj(x_TSC)
+        # Embed with all actions
+        x_TSC = self.embed_with_actions(x_TS, actions)
+        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
+        
+        # Extract video tokens (remove action token)
+        x_TSC_video = x_TSC[:, :, 1:, :]
+        
+        contact_logits_TSC = self.out_contact_proj(x_TSC_video)
         contact_logits_CTHW = rearrange(contact_logits_TSC, "B T (H W) C -> B C T H W", H=h, W=w)
+        contact_logits_future = contact_logits_CTHW[:, :, num_prompt_frames:]
         
-        # Only take future frames
-        contact_logits_future = contact_logits_CTHW[:, :, num_prompt_frames:]  # (B, C, num_future, H, W)
-        
-        # Convert logits to tokens (greedy or sampled)
         factored_logits = rearrange(
             contact_logits_future,
             "b (num_vocabs vocab_size) t h w -> b vocab_size num_vocabs t h w",
@@ -180,15 +198,14 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             num_vocabs=self.config.num_factored_vocabs
         )
         
-        # Sample or argmax for each position
         contact_tokens = torch.zeros((bs, num_future_frames, h, w), dtype=torch.long, device=video_THW.device)
         
         for t_idx in range(num_future_frames):
-            frame_logits = factored_logits[:, :, :, t_idx]  # (B, vocab_size, num_vocabs, H, W)
+            frame_logits = factored_logits[:, :, :, t_idx]
             frame_probs = torch.nn.functional.softmax(frame_logits, dim=1)
             
             samples_HW = torch.zeros((bs, h, w), dtype=torch.long, device=video_THW.device)
-            for probs in frame_probs.flip(2).unbind(2):  # iterate over factored vocabs
+            for probs in frame_probs.flip(2).unbind(2):
                 if temperature <= 1e-8:
                     sample = probs.argmax(dim=1)
                 else:
@@ -215,53 +232,30 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self,
         prompt_THW: torch.LongTensor,
         out_t: int,
-        history_actions: torch.FloatTensor = None,  # Add this
-        future_actions: torch.FloatTensor = None,   # Add this
+        actions: torch.FloatTensor = None,  # Changed: full actions
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         unmask_mode: str = "random",
     ) -> tuple[torch.LongTensor, torch.FloatTensor]:
-        """
-        Performs MaskGIT-style inference to predict frame `out_t`.
-
-        Args:
-            prompt_THW: Unfactorized token ids, size (B, T, H, W)
-            out_t: Will return predicted unfactorized token ids for this frame.
-                Should be >= 1 as the 0th frame is assumed to be given.
-                Expects all future frames to be fully masked.
-            maskgit_steps: The number of MaskGIT-style inference steps to take.
-            temperature: Sampling temperature.
-                In the factorized case, sampling is performed for each factorized vocabulary independently.
-                If temperature is <= 1e-8, will be greedy (i.e. argmax) instead of actual sampling.
-            unmask_mode: The method to determine tokens to unmask during each step of MaskGIT inference.
-                Options:
-                    - "greedy" for unmasking the most confident tokens, which is matches the original MaskGIT
-                    - "random" for randomly choosing tokens to unmask
-                "greedy" tends to copy the previous frame, so we default to "random" instead.
-
-        Returns: (sample_HW, factored_logits)
-            sample_HW: size (B, H, W) corresponding to predicted unfactorized token ids for frame `out_t`.
-            factored_logits: size (B, factored_vocab_size, num_factored_vocabs, H, W).
-        """
-        # assume we have pre-masked z{out_t}...zT with all masks
+        """..."""
         assert out_t, "maskgit_generate requires out_t > 0"
-        assert torch.all(prompt_THW[:, out_t:] == self.mask_token_id), \
-            f"when generating z{out_t}, frames {out_t} and later must be masked"
+        assert torch.all(prompt_THW[:, out_t:] == self.mask_token_id)
 
-        bs, t, h, w = prompt_THW.size(0), prompt_THW.size(1), prompt_THW.size(2), prompt_THW.size(3)
+        bs, t, h, w = prompt_THW.size()
+        
+        # Handle missing actions
+        if actions is None:
+            actions = torch.zeros(bs, t, 3, device=prompt_THW.device, dtype=torch.float32)
 
-        # this will be modified in place on each iteration of this loop
         unmasked = self.init_mask(prompt_THW)
 
-        # Pass actions to compute_logits
-        logits_CTHW = self.compute_logits(prompt_THW, history_actions, future_actions)
+        logits_CTHW = self.compute_logits(prompt_THW, actions)
         logits_CHW = logits_CTHW[:, :, out_t]
         orig_logits_CHW = logits_CHW.clone()
         
         for step in tqdm(range(maskgit_steps)):
             if step > 0:
-                # Pass actions here too
-                logits_CHW = self.compute_logits(prompt_THW, history_actions, future_actions)[:, :, out_t]
+                logits_CHW = self.compute_logits(prompt_THW, actions)[:, :, out_t]
         
             factored_logits = rearrange(logits_CHW, "b (num_vocabs vocab_size) h w -> b vocab_size num_vocabs h w",
                                         vocab_size=self.config.factored_vocab_size,
@@ -272,10 +266,9 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             samples_HW = torch.zeros((bs, h, w), dtype=torch.long, device=prompt_THW.device)
             confidences_HW = torch.ones((bs, h, w), dtype=torch.float, device=prompt_THW.device)
             for probs in factored_probs.flip(2).unbind(2):
-                if temperature <= 1e-8:  # greedy sampling
+                if temperature <= 1e-8:
                     sample = probs.argmax(dim=1)
                 else:
-                    # Categorical expects last dim to be channel dim
                     dist = torch.distributions.categorical.Categorical(
                         probs=rearrange(probs, "b vocab_size ... -> b ... vocab_size") / temperature
                     )
@@ -286,38 +279,27 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
             prev_unmasked = unmasked.clone()
             prev_img_flat = rearrange(prompt_THW[:, out_t], "B H W -> B (H W)")
-
             samples_flat = samples_HW.reshape(bs, self.config.S)
 
-            if step != maskgit_steps - 1:  # skip masking for last maskgit step
-                # use cosine mask scheduling function, n is how many of frame out_t to mask
+            if step != maskgit_steps - 1:
                 n = math.ceil(cosine_schedule((step + 1) / maskgit_steps) * self.config.S)
 
                 if unmask_mode == "greedy":
-                    # set the n patches with the least confidence to mask_token
                     confidences_flat = confidences_HW.reshape(bs, self.config.S)
                 elif unmask_mode == "random":
-                    # randomize confidences, so that patches are randomly masked
                     confidences_flat = torch.rand_like(confidences_HW).reshape(bs, self.config.S)
-                    # not probability distribution anymore, but only relative order matters
                 else:
-                    raise NotImplementedError(f"Expected `unmask_mode` to be one of ['greedy', 'random'], "
-                                              f"got {unmask_mode}")
+                    raise NotImplementedError
 
                 confidences_flat[unmasked] = torch.inf
                 least_confident_tokens = torch.argsort(confidences_flat, dim=1)
-                # unmask the (self.config.S - n) most confident tokens
                 unmasked.scatter_(1, least_confident_tokens[:, n:], True)
                 samples_flat.scatter_(1, least_confident_tokens[:, :n], self.mask_token_id)
 
-            # copy previously unmasked values from prompt input into sample
             samples_flat[prev_unmasked] = prev_img_flat[prev_unmasked]
             samples_HW = samples_flat.reshape(-1, h, w)
-
-            # feed back to iteratively decode
             prompt_THW[:, out_t] = samples_HW
 
-        # Return the final sample and logits
         return samples_HW, rearrange(
             orig_logits_CHW, "B (num_vocabs vocab_size) H W -> B vocab_size num_vocabs H W",
             vocab_size=self.config.factored_vocab_size, num_vocabs=self.config.num_factored_vocabs, H=h, W=w
@@ -343,38 +325,11 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         loss_THW = F.cross_entropy(factored_logits, factored_targets, reduction="none").sum(dim=1)
         acc_THW = (factored_logits.argmax(dim=1) == factored_targets).all(dim=1)
 
-
-        print(f"\nTargets debug:")
-        print(f"  factored_targets shape: {factored_targets.shape}")
-        print(f"  factored_targets min: {factored_targets.min().item()}")
-        print(f"  factored_targets max: {factored_targets.max().item()}")
-        print(f"  unique targets: {torch.unique(factored_targets).shape[0]}")
-
-        # DEBUG: Print shapes and sample values
-        print(f"\n=== Loss/Accuracy Debug ===")
-        print(f"loss_THW shape: {loss_THW.shape}")
-        print(f"acc_THW shape: {acc_THW.shape}")
-        print(f"relevant_mask_THW shape: {relevant_mask_THW.shape}")
-        
-        print(f"\nLoss values (first 10 masked positions):")
-        masked_losses = loss_THW[relevant_mask_THW][:10]
-        print(f"  {masked_losses.tolist()}")
-        
-        print(f"\nAccuracy values (first 10 masked positions):")
-        masked_accs = acc_THW[relevant_mask_THW][:10]
-        print(f"  {masked_accs.tolist()}")
-        
-        print(f"\nLoss statistics:")
-        print(f"  Min loss: {loss_THW.min().item():.3f}")
-        print(f"  Max loss: {loss_THW.max().item():.3f}")
-        print(f"  Mean loss (all): {loss_THW.mean().item():.3f}")
-        print(f"  Mean loss (masked): {loss_THW[relevant_mask_THW].mean().item():.3f}")
-        
-        print(f"\nAccuracy statistics:")
-        print(f"  Correct predictions (masked): {acc_THW[relevant_mask_THW].sum().item()}")
-        print(f"  Total masked tokens: {relevant_mask_THW.sum().item()}")
-        print(f"  Accuracy (masked): {acc_THW[relevant_mask_THW].float().mean().item():.4f}")
-        
+        # Compact debug
+        t_stats = (factored_targets.shape, int(factored_targets.min()), int(factored_targets.max()), len(torch.unique(factored_targets)))
+        l_stats = (loss_THW.min().item(), loss_THW.max().item(), loss_THW[relevant_mask_THW].mean().item())
+        a_stats = (acc_THW[relevant_mask_THW].sum().item(), relevant_mask_THW.sum().item(), acc_THW[relevant_mask_THW].float().mean().item())
+        print(f"[Video] targets={t_stats}, loss(min/max/masked)={l_stats[0]:.2f}/{l_stats[1]:.2f}/{l_stats[2]:.2f}, acc={a_stats[0]}/{a_stats[1]}={a_stats[2]:.4f}", flush=True)
 
         # Compute the mean masked error.
         # Multiply loss values by mask instead of indexing them, more computationally efficient.
@@ -393,9 +348,6 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         relevant_mask_THW: (B, T-1, H, W) - mask indicating which tokens were masked
         """
         
-         # DEBUG: Check input BEFORE factorization
-        stats = (int(targets_THW.min()), int(targets_THW.max()), len(torch.unique(targets_THW)))
-        print(f"[Contact] BEFORE factorize: shape={targets_THW.shape}, min/max/unique={stats}", flush=True)
         factored_logits = rearrange(logits_CTHW,
                                     "b (num_vocabs vocab_size) t h w -> b vocab_size num_vocabs t h w",
                                     vocab_size=self.config.factored_vocab_size,
@@ -407,43 +359,23 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             factored_vocab_size=self.config.factored_vocab_size
         )
 
-        factored_stats = (int(factored_targets.min()), int(factored_targets.max()), len(torch.unique(factored_targets)))
-        print(f"[Contact] AFTER factorize: shape={factored_targets.shape}, min/max/unique={factored_stats}", flush=True)
+        factored_stats = (factored_targets.shape, int(factored_targets.min()), int(factored_targets.max()), len(torch.unique(factored_targets)))
+        print(f"[Contact] targets: shape/min/max/unique={factored_stats}", flush=True)
 
         # Focal Loss: (1 - p_t)^gamma * CE
-        # gamma=2.0 focuses more on hard examples (non-black contact regions)
         gamma = 0.0
-        ce_loss = F.cross_entropy(factored_logits, factored_targets, reduction="none")  # (B, num_vocabs, T-1, H, W)
-        p_t = torch.exp(-ce_loss)  # probability of correct class
+        ce_loss = F.cross_entropy(factored_logits, factored_targets, reduction="none")
+        p_t = torch.exp(-ce_loss)
         focal_weight = (1 - p_t) ** gamma
         focal_loss = focal_weight * ce_loss
-        loss_THW = focal_loss.sum(dim=1)  # sum over num_vocabs dimension
+        loss_THW = focal_loss.sum(dim=1)
         
         acc_THW = (factored_logits.argmax(dim=1) == factored_targets).all(dim=1)
 
-        print(f"\n=== [Contact] Loss/Accuracy Debug (Focal Loss gamma={gamma}) ===")
-        print(f"loss_THW shape: {loss_THW.shape}")
-        print(f"acc_THW shape: {acc_THW.shape}")
-        print(f"relevant_mask_THW shape: {relevant_mask_THW.shape}")
-
-        print(f"\n[Contact] Loss values (first 10 masked positions):")
-        masked_losses = loss_THW[relevant_mask_THW][:10]
-        print(f"  {masked_losses.tolist()}")
-
-        print(f"\n[Contact] Accuracy values (first 10 masked positions):")
-        masked_accs = acc_THW[relevant_mask_THW][:10]
-        print(f"  {masked_accs.tolist()}")
-
-        print(f"\n[Contact] Loss statistics:")
-        print(f"  Min loss: {loss_THW.min().item():.3f}")
-        print(f"  Max loss: {loss_THW.max().item():.3f}")
-        print(f"  Mean loss (all): {loss_THW.mean().item():.3f}")
-        print(f"  Mean loss (masked): {loss_THW[relevant_mask_THW].mean().item():.3f}")
-
-        print(f"\n[Contact] Accuracy statistics:")
-        print(f"  Correct predictions (masked): {acc_THW[relevant_mask_THW].sum().item()}")
-        print(f"  Total masked tokens: {relevant_mask_THW.sum().item()}")
-        print(f"  Accuracy (masked): {acc_THW[relevant_mask_THW].float().mean().item():.4f}")
+        # Compact debug
+        l_stats = (loss_THW.min().item(), loss_THW.max().item(), loss_THW[relevant_mask_THW].mean().item())
+        a_stats = (acc_THW[relevant_mask_THW].sum().item(), relevant_mask_THW.sum().item(), acc_THW[relevant_mask_THW].float().mean().item())
+        print(f"[Contact] loss(min/max/masked)={l_stats[0]:.2f}/{l_stats[1]:.2f}/{l_stats[2]:.2f}, acc={a_stats[2]:.4f}", flush=True)
 
         # Compute the mean masked error
         num_masked_tokens = torch.sum(relevant_mask_THW)
@@ -452,63 +384,64 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         return relevant_loss, relevant_acc
 
-    def compute_logits(self, x_THW, history_actions=None, future_actions=None):
-        # x_THW: (B, T, H, W) - contains history frames + masked future frames
-        x_TS = rearrange(x_THW, "B T H W -> B T (H W)")  # (B, T, S)
-        x_TSC = self.token_embed(x_TS)  # (B, T, S, d_model)
-
-        # Pass separate action streams to transformer
-        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC, 
-                            history_actions=history_actions, 
-                            future_actions=future_actions)
-        x_next_TSC = self.out_x_proj(x_TSC)
-
+    def compute_logits(self, x_THW, actions=None):  # Changed signature
+        x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
+        
+        # Handle missing actions
+        if actions is None:
+            actions = torch.zeros(x_THW.size(0), x_THW.size(1), 3, 
+                                  device=x_THW.device, dtype=torch.float32)
+        
+        # Embed with actions
+        x_TSC = self.embed_with_actions(x_TS, actions)
+        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
+        
+        # Extract video tokens (remove action token)
+        x_TSC_video = x_TSC[:, :, 1:, :]
+        
+        x_next_TSC = self.out_x_proj(x_TSC_video)
         logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
         return logits_CTHW
 
-    def forward(self, input_ids, labels, actions=None, history_actions=None, future_actions=None, 
-                contact_labels=None, **kwargs):  # Changed from future_contact to contact_labels
+    def forward(self, input_ids, labels, actions=None, contact_labels=None, **kwargs):
         T, H, W = self.config.T, self.h, self.w
         x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
-
-        # Use the separated action inputs - get hidden states
         x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
-        x_TSC = self.token_embed(x_TS)
-        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC, 
-                            history_actions=history_actions, 
-                            future_actions=future_actions)
+
+        # Handle missing actions
+        if actions is None:
+            actions = torch.zeros(input_ids.size(0), T, 3, 
+                                  device=input_ids.device, dtype=torch.float32)
         
-        # Video prediction logits
-        video_logits_TSC = self.out_x_proj(x_TSC)
+        # Embed with actions
+        x_TSC = self.embed_with_actions(x_TS, actions)
+        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
+        
+        # Extract video tokens (remove action token)
+        x_TSC_video = x_TSC[:, :, 1:, :]
+        
+        video_logits_TSC = self.out_x_proj(x_TSC_video)
         logits_CTHW = rearrange(video_logits_TSC, "B T (H W) C -> B C T H W", H=H, W=W)
 
         labels = rearrange(labels, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
-        # Record the loss over masked tokens only
         relevant_mask = x_THW[:, 1:] == self.mask_token_id
         video_loss, video_acc = self.compute_loss_and_acc(logits_CTHW, labels, relevant_mask)
 
-        # Contact prediction loss (only computed on masked positions via relevant_mask)
         contact_loss = torch.tensor(0.0, device=input_ids.device)
         contact_acc = torch.tensor(0.0, device=input_ids.device)
         if contact_labels is not None:
-            # Contact logits for all frames
-            contact_logits_TSC = self.out_contact_proj(x_TSC)
+            contact_logits_TSC = self.out_contact_proj(x_TSC_video)
             contact_logits_CTHW = rearrange(contact_logits_TSC, "B T (H W) C -> B C T H W", H=H, W=W)
             
-            # Extract frames 1: onwards (same as video loss) - shape: (B, C, T-1, H, W)
             contact_logits_future = contact_logits_CTHW[:, :, 1:]
-            
-            # Reshape full contact labels: (B, T*H*W) -> (B, T, H, W) -> (B, T-1, H, W)
             contact_labels_THW = rearrange(contact_labels, "B (T H W) -> B T H W", T=T, H=H, W=W)
-            contact_labels_future = contact_labels_THW[:, 1:]  # frames 1 to T-1
+            contact_labels_future = contact_labels_THW[:, 1:]
             
-            # Compute contact loss only on masked positions (relevant_mask handles this)
             contact_loss, contact_acc = self.compute_contact_loss_and_acc(
                 contact_logits_future, contact_labels_future, relevant_mask
             )
         
-        # Combine losses
         contact_weight = getattr(self.config, 'contact_loss_weight', 1.0)
         total_loss = video_loss + contact_weight * contact_loss
 

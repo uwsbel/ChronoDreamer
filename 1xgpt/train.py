@@ -272,23 +272,18 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
         
         # Extract actions if available
-        history_actions = None
-        future_actions = None
         if "actions" in batch:
-            # Use full actions and re-slice to match our num_prompt_frames
             full_actions = batch["actions"][:4].to(accelerator.device)  # (4, window_size, 3)
-            history_actions = full_actions[:, :num_prompt_frames, :]
-            future_actions = full_actions[:, num_prompt_frames:, :]
-        
-        # Generate video and contact predictions
+        else:
+            full_actions = None
+
         video_outputs, contact_outputs = unwrapped_model.generate(
             input_ids=prompt_input_ids, 
             attention_mask=torch.ones_like(prompt_input_ids),
-            history_actions=history_actions,
-            future_actions=future_actions,
+            actions=full_actions,  # Pass full actions
             max_new_tokens=num_new_tokens, 
             min_new_tokens=num_new_tokens,
-            return_contact=True,  # NEW: request contact predictions
+            return_contact=True,
         )
         
         # Process video tokens

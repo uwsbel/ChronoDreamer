@@ -54,6 +54,10 @@ def parse_args():
              "`prompt | predictions | gtruth` in `video.bin`, `window_size` in `metadata.json`."
              "Therefore, comic should be disabled when visualizing videos without this format, such as the dataset."
     )
+    parser.add_argument(
+        "--visualize_contact", action="store_true",
+        help="If specified, will also visualize contact_splat.bin if it exists."
+    )
     args = parser.parse_args()
 
     return args
@@ -192,29 +196,104 @@ def main():
     export_to_gif(captioned_frames, output_gif_path, args.fps)
     print(f"Saved to {output_gif_path}")
 
-    if not args.disable_comic:
-        fig, axs = plt.subplots(nrows=2, ncols=metadata["window_size"], figsize=(3 * metadata["window_size"], 3 * 2))
-        for i, image in enumerate(video_frames):
-            if i < metadata["num_prompt_frames"]:
-                curr_axs = [axs[0, i], axs[1, i]]
-                title = "Prompt"
-
-            elif i < metadata["window_size"]:
-                curr_axs = [axs[0, i]]
-                title = "Prediction"
+    # Visualize contact if requested and available
+    contact_frames = None
+    if args.visualize_contact:
+        contact_path = os.path.join(args.token_dir, "contact_splat.bin")
+        if os.path.exists(contact_path):
+            # For generated data, contact has different frame count than video
+            # Load it directly with the correct shape instead of using RawTokenDataset
+            if is_generated_data:
+                num_future_frames = metadata["window_size"] - metadata["num_prompt_frames"]
+                # Contact structure: [predicted (num_future) | ground_truth (num_future)]
+                num_contact_frames = num_future_frames * 2
+                contact_shape = (num_contact_frames, metadata["s"], metadata["s"])
             else:
-                curr_axs = [axs[1, i - metadata["window_size"] + metadata["num_prompt_frames"]]]
-                title = "Ground truth"
+                # For training/raw data, contact has same shape as video
+                contact_shape = (metadata["num_images"], metadata["s"], metadata["s"])
+            
+            token_dtype = np.dtype(metadata.get("token_dtype", "uint32"))
+            contact_tokens = np.memmap(contact_path, dtype=token_dtype, mode="r", shape=contact_shape)
+            contact_frames = decode_latents_wrapper(max_images=args.max_images)(contact_tokens[args.offset::args.stride])
+            
+            contact_gif_path = os.path.join(args.token_dir, f"contact_offset{args.offset}.gif")
+            
+            if is_generated_data:
+                # Contact has [predicted | ground_truth] (no prompt frames)
+                captioned_contact = []
+                for i, frame in enumerate(contact_frames):
+                    if i < num_future_frames:
+                        caption = "Contact: Generated"
+                    else:
+                        caption = "Contact: Ground truth"
+                    captioned_contact.append(caption_image(frame, caption))
+            else:
+                captioned_contact = contact_frames
+                
+            export_to_gif(captioned_contact, contact_gif_path, args.fps)
+            print(f"Saved contact to {contact_gif_path}")
+        else:
+            print("Warning: --visualize_contact specified but no contact_splat.bin found")
 
-            for ax in curr_axs:
-                ax.set_title(title)
-                ax.imshow(image)
-                ax.axis("off")
+    if not args.disable_comic:
+        # Comic generation only works for generated data format
+        if not is_generated_data:
+            print("Warning: Comic generation skipped - metadata missing 'window_size' or 'num_prompt_frames'. "
+                  "Use --disable_comic for raw dataset visualization.")
+        else:
+            # Determine number of rows based on whether we have contact
+            has_contact = args.visualize_contact and contact_frames is not None
+            nrows = 4 if has_contact else 2
+            
+            fig, axs = plt.subplots(nrows=nrows, ncols=metadata["window_size"], 
+                                    figsize=(3 * metadata["window_size"], 3 * nrows))
+            
+            for i, image in enumerate(video_frames):
+                if i < metadata["num_prompt_frames"]:
+                    curr_axs = [axs[0, i], axs[1, i]]
+                    title = "Prompt"
 
-        output_comic_path = os.path.join(args.token_dir, f"generated_comic_offset{args.offset}.png")
-        plt.savefig(output_comic_path, bbox_inches="tight")
-        plt.close()
-        print(f"Saved to {output_comic_path}")
+                elif i < metadata["window_size"]:
+                    curr_axs = [axs[0, i]]
+                    title = "Prediction"
+                else:
+                    curr_axs = [axs[1, i - metadata["window_size"] + metadata["num_prompt_frames"]]]
+                    title = "Ground truth"
+
+                for ax in curr_axs:
+                    ax.set_title(title)
+                    ax.imshow(image)
+                    ax.axis("off")
+            
+            # Add contact rows if available
+            # Note: Contact has [predicted | ground_truth] format (no prompt frames)
+            if has_contact:
+                num_future_frames = metadata["window_size"] - metadata["num_prompt_frames"]
+                
+                # Leave prompt columns empty for contact rows
+                for i in range(metadata["num_prompt_frames"]):
+                    axs[2, i].axis("off")
+                    axs[3, i].axis("off")
+                
+                # Plot contact frames starting at num_prompt_frames column
+                for i, image in enumerate(contact_frames):
+                    if i < num_future_frames:
+                        # Predicted contact - goes in row 2, columns after prompt
+                        col_idx = metadata["num_prompt_frames"] + i
+                        axs[2, col_idx].set_title("Contact: Pred")
+                        axs[2, col_idx].imshow(image)
+                        axs[2, col_idx].axis("off")
+                    else:
+                        # Ground truth contact - goes in row 3, columns after prompt
+                        col_idx = metadata["num_prompt_frames"] + (i - num_future_frames)
+                        axs[3, col_idx].set_title("Contact: GT")
+                        axs[3, col_idx].imshow(image)
+                        axs[3, col_idx].axis("off")
+
+            output_comic_path = os.path.join(args.token_dir, f"generated_comic_offset{args.offset}.png")
+            plt.savefig(output_comic_path, bbox_inches="tight")
+            plt.close()
+            print(f"Saved to {output_comic_path}")
 
 
 if __name__ == "__main__":

@@ -59,6 +59,10 @@ def parse_args():
         "--temperature", type=float, default=0,
         help="Sampling temperature. If `temperature` <= 1e-8, will do greedy sampling."
     )
+    parser.add_argument(
+        "--generate_contact", action="store_true",
+        help="If True, also generate and save contact predictions."
+    )
 
     return parser.parse_args()
 
@@ -70,15 +74,23 @@ def main():
     val_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size, stride=STRIDE)
     latent_side_len = val_dataset.metadata["s"]
 
+    # Handle --start_frame override
+    if args.start_frame is not None:
+        # Find which example_ind corresponds to this start_frame
+        # Or directly index into the dataset's valid_start_inds
+        if args.start_frame in val_dataset.valid_start_inds:
+            args.example_ind = val_dataset.valid_start_inds.index(args.start_frame)
+        else:
+            # Find nearest valid start
+            print(f"Warning: start_frame {args.start_frame} not in valid_start_inds, using example_ind instead")
+
     # Get single example INCLUDING ACTIONS
     example_data = val_dataset[args.example_ind]
     example_THW = example_data["input_ids"].reshape(1, args.window_size, latent_side_len, latent_side_len).to("cuda")
 
     # ✅ Extract actions from the example
     example_actions = example_data["actions"].unsqueeze(0).to("cuda")  # (1, window_size, 3)
-    history_actions = example_actions[:, :args.num_prompt_frames, :]    # (1, num_prompt_frames, 3)
-    future_actions = example_actions[:, args.num_prompt_frames:, :]     # (1, num_future_frames, 3)
-
+    
     # Load the model checkpoint
     model = STMaskGIT.from_pretrained(args.checkpoint_dir).to("cuda")
     model.eval()
@@ -96,8 +108,7 @@ def main():
         samples_HW, _ = model.maskgit_generate(
             prompt_THW,
             out_t=timestep,
-            history_actions=history_actions,  # ✅ Add this
-            future_actions=future_actions,    # ✅ Add this
+            actions=example_actions,  # Full actions sequence
             maskgit_steps=args.maskgit_steps,
             temperature=args.temperature,
         )
@@ -118,6 +129,36 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs.cpu().numpy().astype(np.dtype(val_dataset.metadata["token_dtype"])).tofile(output_dir / "video.bin")
+
+    # Generate and save contact if requested
+    if args.generate_contact:
+        # Use the final predicted video (not ground truth) for contact generation
+        predicted_video = torch.cat([
+            example_THW[:, :args.num_prompt_frames],  # prompt frames
+            torch.stack(samples, dim=1)  # predicted frames
+        ], dim=1)
+        
+        contact_tokens = model.generate_contact(
+            predicted_video,
+            actions=example_actions,
+            num_prompt_frames=args.num_prompt_frames,
+            temperature=args.temperature,
+        )
+        
+        # Also get ground truth contact if available
+        if "contact" in example_data:
+            gt_contact = example_data["contact"].reshape(1, args.window_size, latent_side_len, latent_side_len).to("cuda")
+            gt_contact_future = gt_contact[:, args.num_prompt_frames:]
+            
+            # Stack: [predicted_contact, ground_truth_contact]
+            contact_outputs = torch.cat([contact_tokens, gt_contact_future], dim=1)
+        else:
+            contact_outputs = contact_tokens
+        
+        contact_outputs.cpu().numpy().astype(np.dtype(val_dataset.metadata["token_dtype"])).tofile(
+            output_dir / "contact_splat.bin"
+        )
+        print(f"Saved contact tokens to {output_dir / 'contact_splat.bin'}")
 
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(vars(args) | val_dataset.metadata | {

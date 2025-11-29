@@ -218,11 +218,10 @@ def get_maskgit_collator(config: GenieConfig):
         return {
             "input_ids": rearrange(x_THW, "b t h w -> b (t h w)"),
             "labels": rearrange(labels, "b t h w -> b (t h w)"),
-            "contact_labels": rearrange(contact_THW, "b t h w -> b (t h w)"),  # full sequence
-            "actions": actions,  # full sequence
-            "history_actions": history_actions,
-            "future_actions": future_actions,
-            "first_masked_frame": first_masked_frame,  # for debugging/inspection
+            "contact_labels": rearrange(contact_THW, "b t h w -> b (t h w)"),
+            "actions": actions,  # Full sequence (B, T, 3)
+            # REMOVED: history_actions, future_actions
+            "first_masked_frame": first_masked_frame,
         }
 
     return collate_fn

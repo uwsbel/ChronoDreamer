@@ -17,7 +17,7 @@ class GenieConfig:
 
     # Contact prediction
     contact_vocab_size: int = 65536  # vocab size for contact tokens (adjust if different)
-    contact_loss_weight: float = 4.0  # weight for contact prediction loss
+    contact_loss_weight: float = 2.0  # weight for contact prediction loss
 
     # Factorization for large vocabs (e.g. Open-MAGVIT2)
     num_factored_vocabs: int = 1

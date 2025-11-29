@@ -21,10 +21,11 @@ from transformers import default_data_collator
 
 # 1xgpt imports
 sys.path.append(os.getcwd())
-from data import RawTokenDataset
+from data import RawTokenDataset, get_maskgit_collator
 from visualize import decode_latents_wrapper
 from eval_utils import decode_tokens, compute_lpips, AvgMetric, compute_loss
 from genie.st_mask_git import STMaskGIT
+from genie.config import GenieConfig
 
 
 # Hardcoded values for the v1.1 dataset
@@ -79,7 +80,11 @@ class GenieEvaluator:
         self.device = device
         self.args = args
 
-    def predict_zframe_logits(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor, torch.FloatTensor]:
+    def predict_zframe_logits(
+        self, 
+        input_ids: torch.LongTensor,
+        actions: torch.FloatTensor = None,  # Add actions parameter
+    ) -> tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Conditioned on each prefix: [frame_0], [frame_0, frame_1], ..., [frame_0, frame_1, ... frame_{T-1}],
         predict the tokens in the following frame: [pred_frame_1, pred_frame_2, ..., pred_frame_T].
@@ -91,6 +96,7 @@ class GenieEvaluator:
 
         Args:
             input_ids: LongTensor of size (B, T*H*W) corresponding to flattened, tokenized images.
+            actions: FloatTensor of size (B, T, 3) corresponding to actions for each frame.
 
         Returns: (samples_THW, factored_logits)
             samples_THW:
@@ -102,6 +108,11 @@ class GenieEvaluator:
         """
         inputs_THW = rearrange(input_ids, "b (t h w) -> b t h w", t=WINDOW_SIZE,
                                h=self.args.latent_h, w=self.args.latent_w).to(self.device)
+        
+        # Handle actions
+        if actions is not None:
+            actions = actions.to(self.device)
+        
         all_samples = []
         all_logits = []
         for timestep in range(1, WINDOW_SIZE):
@@ -109,9 +120,12 @@ class GenieEvaluator:
             inputs_masked = inputs_THW.clone()
             inputs_masked[:, timestep:] = self.model.mask_token_id
 
-            # MaskGIT sampling
+            # MaskGIT sampling - now with actions
             samples_HW, factored_logits = self.model.maskgit_generate(
-                inputs_masked, out_t=timestep, maskgit_steps=self.args.maskgit_steps,
+                inputs_masked, 
+                out_t=timestep, 
+                actions=actions,  # Pass actions here
+                maskgit_steps=self.args.maskgit_steps,
                 temperature=self.args.temperature,
             )
 
@@ -156,7 +170,13 @@ def main():
     if args.max_examples is not None:
         val_dataset.valid_start_inds = val_dataset.valid_start_inds[:args.max_examples]
 
-    dataloader = DataLoader(val_dataset, collate_fn=default_data_collator, batch_size=args.batch_size)
+    # Load model config and use proper collator
+    model = STMaskGIT.from_pretrained(args.checkpoint_dir)
+    config = model.config
+    
+    # Use the proper collator that handles actions
+    collate_fn = get_maskgit_collator(config)
+    dataloader = DataLoader(val_dataset, collate_fn=collate_fn, batch_size=args.batch_size)
 
     evaluator = GenieEvaluator(args, decode_latents)
     metrics = defaultdict(AvgMetric)
@@ -169,8 +189,14 @@ def main():
         reshaped_input_ids = rearrange(batch["input_ids"], "b (t h w) -> b t h w", t=WINDOW_SIZE,
                                        h=args.latent_h, w=args.latent_w)
 
+        # Extract actions from batch
+        actions = batch.get("actions", None)
+
         start_time = time.time()
-        samples, factored_logits = evaluator.predict_zframe_logits(batch["input_ids"])
+        samples, factored_logits = evaluator.predict_zframe_logits(
+            batch["input_ids"],
+            actions=actions,  # Pass actions
+        )
         frames_per_batch = (WINDOW_SIZE - 1) * batch["input_ids"].size(0)
         metrics["gen_time"].update((time.time() - start_time) / frames_per_batch, batch_size)
 
