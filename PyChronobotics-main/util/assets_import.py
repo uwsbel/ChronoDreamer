@@ -105,7 +105,7 @@ class AssetsImporter:
         return table
 
     
-    def box(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01):
+    def box(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01, sliding_friction=0.3):
         """Import a box asset into the system, formed by a mesh loaded from a file.
         
         Args:
@@ -136,12 +136,29 @@ class AssetsImporter:
         else:
             contact_material = chrono.ChContactMaterialSMC()
 
-        contact_material.SetRollingFriction(rolling_friction)
-        contact_material.SetKn(2e8)
-
+        # Apply +/-10% variation to base rolling friction
+        rolling_friction_variation = np.random.uniform(0.9, 1.1)
+        varied_rolling_friction = rolling_friction * rolling_friction_variation
+        contact_material.SetRollingFriction(varied_rolling_friction)
+        
+        # Apply +/-10% variation to base sliding friction
+        sliding_friction_variation = np.random.uniform(0.9, 1.1)
+        varied_sliding_friction = sliding_friction * sliding_friction_variation
+        contact_material.SetFriction(varied_sliding_friction)
+        
+        # Apply +/-5% variation to Kn for box
+        base_kn = 2e8
+        kn_variation = np.random.uniform(0.95, 1.05)
+        varied_kn = base_kn * kn_variation
+        contact_material.SetKn(varied_kn)
+        
+        # Apply +/-10% variation to density
+        base_density = 1000
+        density_variation = np.random.uniform(0.9, 1.1)
+        varied_density = base_density * density_variation
 
         gcone = chrono.ChBodyEasyMesh(self.project_root + '/data/box_final/sub_0.5.obj', # mesh filename
-                                    1000,             # density kg/m^3
+                                    varied_density,             # density kg/m^3
                                     True,             # automatically compute mass and inertia
                                     True,             # visualize?>
                                     True,             # collide?
@@ -152,7 +169,7 @@ class AssetsImporter:
         self.system.Add(gcone)
         return gcone
 
-    def flashlight(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01):
+    def flashlight(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01, sliding_friction=0.3):
         """Import a green cone asset into the system, formed by a mesh loaded from a file. Note that the cone's collision shape is a cylinder.
         while the visualization is a mesh.
         
@@ -165,8 +182,21 @@ class AssetsImporter:
         else:
             contact_material = chrono.ChContactMaterialSMC()
 
-        contact_material.SetRollingFriction(rolling_friction)
-        contact_material.SetKn(2e8)
+        # Apply +/-10% variation to base rolling friction
+        rolling_friction_variation = np.random.uniform(0.9, 1.1)
+        varied_rolling_friction = rolling_friction * rolling_friction_variation
+        contact_material.SetRollingFriction(varied_rolling_friction)
+        
+        # Apply +/-10% variation to base sliding friction
+        sliding_friction_variation = np.random.uniform(0.9, 1.1)
+        varied_sliding_friction = sliding_friction * sliding_friction_variation
+        contact_material.SetFriction(varied_sliding_friction)
+        
+        # Apply +/-5% variation to Kn for flashlight
+        base_kn = 2e8
+        kn_variation = np.random.uniform(0.95, 1.05)
+        varied_kn = base_kn * kn_variation
+        contact_material.SetKn(varied_kn)
 
 
         gcone = chrono.ChBodyEasyMesh(self.project_root + '/data/flashlight_final/flashlight_final.obj', # mesh filename
@@ -185,7 +215,7 @@ class AssetsImporter:
     # You can add more asset-loading functions similarly
 
 
-    def sodacan(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01):
+    def sodacan(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01, sliding_friction=0.3):
         """Import a soda can asset into the system, formed by a mesh loaded from a file. Note that the can's collision shape is a cylinder.
         while the visualization is a mesh.
         
@@ -198,11 +228,29 @@ class AssetsImporter:
         else:
             contact_material = chrono.ChContactMaterialSMC()
 
-        contact_material.SetRollingFriction(rolling_friction)
-        contact_material.SetKn(5e9)
+        # Apply +/-10% variation to base rolling friction
+        rolling_friction_variation = np.random.uniform(0.9, 1.1)
+        varied_rolling_friction = rolling_friction * rolling_friction_variation
+        contact_material.SetRollingFriction(varied_rolling_friction)
+        
+        # Apply +/-10% variation to base sliding friction
+        sliding_friction_variation = np.random.uniform(0.9, 1.1)
+        varied_sliding_friction = sliding_friction * sliding_friction_variation
+        contact_material.SetFriction(varied_sliding_friction)
+        
+        # Apply +/-5% variation to Kn for soda can
+        base_kn = 5e9
+        kn_variation = np.random.uniform(0.95, 1.05)
+        varied_kn = base_kn * kn_variation
+        contact_material.SetKn(varied_kn)
+        
+        # Apply +/-10% variation to density
+        base_density = 1000
+        density_variation = np.random.uniform(0.9, 1.1)
+        varied_density = base_density * density_variation
 
         gsodacan = chrono.ChBodyEasyMesh(self.project_root + '/data/soda_can/soda_can.obj', # mesh filename
-                                    1000,             # density kg/m^3
+                                    varied_density,             # density kg/m^3
                                     True,             # automatically compute mass and inertia
                                     True,             # visualize?
                                     True,             # collide?
@@ -216,7 +264,7 @@ class AssetsImporter:
 
 
 
-    def waterbottle(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01):
+    def waterbottle(self, position=chrono.ChVector3d(0, 0, 0), collidable=True, rolling_friction=0.01, sliding_friction=0.3):
         """Import a water bottle asset into the system, formed by a mesh loaded from a file. Note that the bottle's collision shape is a cylinder.
         while the visualization is a mesh.
         
@@ -229,11 +277,29 @@ class AssetsImporter:
         else:
             contact_material = chrono.ChContactMaterialSMC()
 
-        contact_material.SetRollingFriction(rolling_friction)
-        contact_material.SetKn(5e9)
+        # Apply +/-10% variation to base rolling friction
+        rolling_friction_variation = np.random.uniform(0.9, 1.1)
+        varied_rolling_friction = rolling_friction * rolling_friction_variation
+        contact_material.SetRollingFriction(varied_rolling_friction)
+        
+        # Apply +/-10% variation to base sliding friction
+        sliding_friction_variation = np.random.uniform(0.9, 1.1)
+        varied_sliding_friction = sliding_friction * sliding_friction_variation
+        contact_material.SetFriction(varied_sliding_friction)
+        
+        # Apply +/-5% variation to Kn for water bottle
+        base_kn = 5e9
+        kn_variation = np.random.uniform(0.95, 1.05)
+        varied_kn = base_kn * kn_variation
+        contact_material.SetKn(varied_kn)
+        
+        # Apply +/-10% variation to density
+        base_density = 1200
+        density_variation = np.random.uniform(0.9, 1.1)
+        varied_density = base_density * density_variation
 
         gwaterbottle = chrono.ChBodyEasyMesh(self.project_root + '/data/water_bottle/water_bottle.obj', # mesh filename
-                                    1200,             # density kg/m^3
+                                    varied_density,             # density kg/m^3
                                     True,             # automatically compute mass and inertia
                                     True,             # visualize?
                                     True,             # collide?

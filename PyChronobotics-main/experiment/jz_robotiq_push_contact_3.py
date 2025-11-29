@@ -487,8 +487,18 @@ import random
 
 # Create a contact material for FEA (SMC material) - same as demo
 fea_contact_material = chrono.ChContactMaterialSMC()
-fea_contact_material.SetYoungModulus(2e4)
-fea_contact_material.SetFriction(0.3)
+
+# Apply +/-5% variation to YoungModulus
+base_young_modulus = 2e4
+young_modulus_variation = np.random.uniform(0.95, 1.05)
+varied_young_modulus = base_young_modulus * young_modulus_variation
+fea_contact_material.SetYoungModulus(varied_young_modulus)
+
+# Apply +/-5% variation to Friction
+base_friction = 0.5
+friction_variation = np.random.uniform(0.95, 1.05)
+varied_friction = base_friction * friction_variation
+fea_contact_material.SetFriction(varied_friction)
 #fea_contact_material.SetRestitution(0.2)
 fea_contact_material.SetAdhesion(0)
 # NOTE: Do NOT set Kn/Kt/Gn/Gt - let Chrono use defaults (demo doesn't set these)
@@ -500,10 +510,26 @@ sphere_swept_thickness = 0.02
 # Create material for tetrahedron elements (soft but stable)
 # =============================================================================
 tet_material = fea.ChContinuumElastic()
-tet_material.SetYoungModulus(0.001e7)  # Rubber-like (not too soft)
-tet_material.SetPoissonRatio(0.3)
+
+# Apply +/-5% variation to YoungModulus
+base_young_modulus = 0.001e7
+young_modulus_variation = np.random.uniform(0.95, 1.05)
+varied_young_modulus = base_young_modulus * young_modulus_variation
+tet_material.SetYoungModulus(varied_young_modulus)  # Rubber-like (not too soft)
+
+# Apply +/-5% variation to PoissonRatio
+base_poisson_ratio = 0.3
+poisson_ratio_variation = np.random.uniform(0.95, 1.05)
+varied_poisson_ratio = base_poisson_ratio * poisson_ratio_variation
+tet_material.SetPoissonRatio(varied_poisson_ratio)
+
 tet_material.SetRayleighDampingBeta(0.1)  # Good damping
-tet_material.SetDensity(500)
+
+# Apply +/-5% variation to Density
+base_density = 500
+density_variation = np.random.uniform(0.95, 1.05)
+varied_density = base_density * density_variation
+tet_material.SetDensity(varied_density)
 
 # =============================================================================
 # Load tetrahedron beams in tower pattern (like Jenga)
