@@ -6,6 +6,7 @@ Example usage: See https://github.com/1x-technologies/1xgpt?tab=readme-ov-file#1
 """
 
 import argparse
+import json
 import math
 import os
 from PIL import Image, ImageDraw
@@ -161,20 +162,52 @@ def caption_image(pil_image: Image, caption: str):
     return new_image
 
 
+def create_side_by_side_frame(left_image: Image, right_image: Image, gap: int = 10) -> Image:
+    """
+    Create a side-by-side image from two PIL images with a gap between them.
+    """
+    left_w, left_h = left_image.size
+    right_w, right_h = right_image.size
+    
+    # Use max height, total width + gap
+    combined_w = left_w + gap + right_w
+    combined_h = max(left_h, right_h)
+    
+    combined = Image.new("RGB", (combined_w, combined_h), "white")
+    combined.paste(left_image, (0, 0))
+    combined.paste(right_image, (left_w + gap, 0))
+    
+    return combined
+
+
 @torch.no_grad()
 def main():
     args = parse_args()
 
-    # Load tokens
-    token_dataset = RawTokenDataset(args.token_dir, 1, filter_interrupts=False, filter_overlaps=False)
-    video_tokens = token_dataset.data
-    metadata = token_dataset.metadata
+    # Load metadata first to determine if this is generated data
+    metadata_path = os.path.join(args.token_dir, "metadata.json")
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    
+    is_generated_data = all(key in metadata for key in ("num_prompt_frames", "window_size"))
+    
+    # Load video tokens directly (bypassing RawTokenDataset to avoid contact shape mismatch)
+    video_path = os.path.join(args.token_dir, "video.bin")
+    token_dtype = np.dtype(metadata.get("dtype", metadata.get("token_dtype", "uint32")))
+    s = metadata["s"]
+    
+    if is_generated_data:
+        # Generated data: [prompt | predicted | ground_truth]
+        num_video_frames = metadata["window_size"] * 2 - metadata["num_prompt_frames"]
+    else:
+        num_video_frames = metadata["num_images"]
+    
+    video_shape = (num_video_frames, s, s)
+    video_tokens = np.memmap(video_path, dtype=token_dtype, mode="r", shape=video_shape)
 
     video_frames = decode_latents_wrapper(max_images=args.max_images)(video_tokens[args.offset::args.stride])
     output_gif_path = os.path.join(args.token_dir, f"generated_offset{args.offset}.gif")
 
-    # `generate` should populate `metadata.json` with these keys, while ground truth metadata does not have them
-    is_generated_data = all(key in metadata for key in ("num_prompt_frames", "window_size"))
     if is_generated_data:
         if video_tokens.shape[0] != metadata["window_size"] * 2 - metadata["num_prompt_frames"]:
             raise ValueError(f"Unexpected {video_tokens.shape=} given {metadata['window_size']=}, {metadata['num_prompt_frames']=}")
@@ -198,6 +231,7 @@ def main():
 
     # Visualize contact if requested and available
     contact_frames = None
+    captioned_contact = None
     if args.visualize_contact:
         contact_path = os.path.join(args.token_dir, "contact_splat.bin")
         if os.path.exists(contact_path):
@@ -212,10 +246,12 @@ def main():
                 # For training/raw data, contact has same shape as video
                 contact_shape = (metadata["num_images"], metadata["s"], metadata["s"])
             
-            token_dtype = np.dtype(metadata.get("token_dtype", "uint32"))
+            # Use "dtype" key (matching generate.py)
+            token_dtype = np.dtype(metadata.get("dtype", metadata.get("token_dtype", "uint32")))
             contact_tokens = np.memmap(contact_path, dtype=token_dtype, mode="r", shape=contact_shape)
             contact_frames = decode_latents_wrapper(max_images=args.max_images)(contact_tokens[args.offset::args.stride])
             
+            # Create separate contact GIF
             contact_gif_path = os.path.join(args.token_dir, f"contact_offset{args.offset}.gif")
             
             if is_generated_data:
@@ -225,13 +261,54 @@ def main():
                     if i < num_future_frames:
                         caption = "Contact: Generated"
                     else:
-                        caption = "Contact: Ground truth"
+                        caption = "Contact: GT"
                     captioned_contact.append(caption_image(frame, caption))
             else:
-                captioned_contact = contact_frames
+                captioned_contact = [caption_image(f, "Contact") for f in contact_frames]
                 
             export_to_gif(captioned_contact, contact_gif_path, args.fps)
             print(f"Saved contact to {contact_gif_path}")
+            
+            # Create COMBINED side-by-side GIF (video | contact)
+            if is_generated_data:
+                num_future_frames = metadata["window_size"] - metadata["num_prompt_frames"]
+                combined_frames = []
+                
+                # For each future frame, show: [video_pred | contact_pred] then [video_gt | contact_gt]
+                # Video layout: [prompt (0..num_prompt-1) | pred (num_prompt..window-1) | gt (window..end)]
+                # Contact layout: [pred (0..num_future-1) | gt (num_future..end)]
+                
+                # Part 1: Prompt frames (video only, no contact for prompt)
+                for i in range(metadata["num_prompt_frames"]):
+                    video_frame = captioned_frames[i]
+                    # Create placeholder for contact (gray or blank)
+                    placeholder = Image.new("RGB", video_frame.size, (200, 200, 200))
+                    placeholder = caption_image(placeholder.crop((0, 36, placeholder.width, placeholder.height)), "Contact: N/A")
+                    combined = create_side_by_side_frame(video_frame, placeholder)
+                    combined_frames.append(combined)
+                
+                # Part 2: Predicted frames (video pred | contact pred)
+                for i in range(num_future_frames):
+                    video_idx = metadata["num_prompt_frames"] + i
+                    contact_idx = i  # Contact pred starts at 0
+                    video_frame = captioned_frames[video_idx]
+                    contact_frame = captioned_contact[contact_idx]
+                    combined = create_side_by_side_frame(video_frame, contact_frame)
+                    combined_frames.append(combined)
+                
+                # Part 3: Ground truth frames (video gt | contact gt)
+                for i in range(num_future_frames):
+                    video_idx = metadata["window_size"] + i
+                    contact_idx = num_future_frames + i  # Contact GT starts at num_future_frames
+                    video_frame = captioned_frames[video_idx]
+                    contact_frame = captioned_contact[contact_idx]
+                    combined = create_side_by_side_frame(video_frame, contact_frame)
+                    combined_frames.append(combined)
+                
+                combined_gif_path = os.path.join(args.token_dir, f"combined_offset{args.offset}.gif")
+                export_to_gif(combined_frames, combined_gif_path, args.fps)
+                print(f"Saved combined (video | contact) to {combined_gif_path}")
+            
         else:
             print("Warning: --visualize_contact specified but no contact_splat.bin found")
 
@@ -276,18 +353,18 @@ def main():
                     axs[3, i].axis("off")
                 
                 # Plot contact frames starting at num_prompt_frames column
-                for i, image in enumerate(contact_frames):
+                for i, frame in enumerate(contact_frames):
                     if i < num_future_frames:
                         # Predicted contact - goes in row 2, columns after prompt
                         col_idx = metadata["num_prompt_frames"] + i
                         axs[2, col_idx].set_title("Contact: Pred")
-                        axs[2, col_idx].imshow(image)
+                        axs[2, col_idx].imshow(frame)
                         axs[2, col_idx].axis("off")
                     else:
                         # Ground truth contact - goes in row 3, columns after prompt
                         col_idx = metadata["num_prompt_frames"] + (i - num_future_frames)
                         axs[3, col_idx].set_title("Contact: GT")
-                        axs[3, col_idx].imshow(image)
+                        axs[3, col_idx].imshow(frame)
                         axs[3, col_idx].axis("off")
 
             output_comic_path = os.path.join(args.token_dir, f"generated_comic_offset{args.offset}.png")

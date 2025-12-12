@@ -19,6 +19,10 @@ class GenieConfig:
     contact_vocab_size: int = 65536  # vocab size for contact tokens (adjust if different)
     contact_loss_weight: float = 2.0  # weight for contact prediction loss
 
+    # Joint angles prediction
+    num_joint_channels: int = 4  # number of joint angle channels (theta_0, theta_1, theta_2, theta_3)
+    joint_loss_weight: float = 1.0  # weight for joint angle prediction loss
+
     # Factorization for large vocabs (e.g. Open-MAGVIT2)
     num_factored_vocabs: int = 1
     factored_vocab_size: int = None

@@ -67,6 +67,16 @@ class RawTokenDataset(TorchDataset):
             self.actions = None
             print(f"warning: actions file not found at {action_tokens_path}; continuing without actions")
 
+        # Load joint_angles.bin (float16, num_frames x 4)
+        joint_angles_path = data_dir / "joint_angles.bin"
+        if joint_angles_path.exists():
+            self.joint_angles = np.memmap(joint_angles_path, dtype=np.float16, mode="r",
+                                          shape=(self.metadata["num_images"], 4))
+            print("finished reading joint angles data")
+        else:
+            self.joint_angles = None
+            print(f"warning: joint_angles file not found at {joint_angles_path}; continuing without joint angles")
+
         if os.path.isfile(segment_ids_path):
             self.segment_ids = np.memmap(
                 segment_ids_path,
@@ -136,12 +146,19 @@ class RawTokenDataset(TorchDataset):
         else:
             actions = torch.from_numpy(self.actions[action_inds].astype(np.float32))  # shape: (window_size, 3)
 
+        # Select joint angles for the same frames as x
+        if self.joint_angles is None:
+            joint_angles = torch.zeros((self.window_size, 4), dtype=torch.float32)
+        else:
+            joint_angles = torch.from_numpy(self.joint_angles[action_inds].astype(np.float32))  # shape: (window_size, 4)
+
         return {
             "input_ids": x,
             "labels": x,
             "attention_mask": attention_mask,
             "actions": actions,
             "contact": contact,  # Add contact data
+            "joint_angles": joint_angles,  # Add joint angles data
         }
 
 
@@ -167,6 +184,9 @@ def get_maskgit_collator(config: GenieConfig):
 
         # Stack actions
         actions = torch.stack([ex["actions"] for ex in features])  # shape: (batch, window_size, 3)
+
+        # Stack joint angles
+        joint_angles = torch.stack([ex["joint_angles"] for ex in features])  # shape: (batch, window_size, 4)
 
         # Add random corruption as before
         r = torch.rand(x_THWC.size(), device=device)
@@ -220,7 +240,7 @@ def get_maskgit_collator(config: GenieConfig):
             "labels": rearrange(labels, "b t h w -> b (t h w)"),
             "contact_labels": rearrange(contact_THW, "b t h w -> b (t h w)"),
             "actions": actions,  # Full sequence (B, T, 3)
-            # REMOVED: history_actions, future_actions
+            "joint_angles": joint_angles,  # Full sequence (B, T, 4)
             "first_masked_frame": first_masked_frame,
         }
 

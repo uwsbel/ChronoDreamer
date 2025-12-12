@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import sys
 import csv
@@ -12,9 +13,16 @@ from tqdm import tqdm
 from cosmos_tokenizer.image_lib import ImageTokenizer
 
 # ---------------------------------------
+# Arguments
+# ---------------------------------------
+parser = argparse.ArgumentParser(description="Encode videos and actions to binary format")
+parser.add_argument("root_dir", type=str, help="Root directory containing experiment folders")
+args = parser.parse_args()
+
+# ---------------------------------------
 # Settings
 # ---------------------------------------
-root_dir = Path("exp_data")        # experiments live here: exp_data/*/{sensor_img, contact_splat, joystick_commands.csv}
+root_dir = Path(args.root_dir)
 
 # Cosmos DI8x8 checkpoint
 cosmos_model_name = "Cosmos-0.1-Tokenizer-DI8x8"
@@ -23,6 +31,7 @@ enc_ckpt_path = cosmos_ckpt_dir / cosmos_model_name / "encoder.jit"
 
 resize_hw = (256, 256)
 batch_size = 8
+SKIP_FRAMES = 125  # Skip the first 125 frames of every video
 
 out_dir = Path("external_data")
 out_dir.mkdir(parents=True, exist_ok=True)
@@ -32,9 +41,10 @@ out_actions  = out_dir / "actions.bin"         # float16 actions: (total_frames,
 out_meta     = out_dir / "metadata.json"
 out_seg      = out_dir / "segment_ids.bin"     # uint32: (total_frames,)
 out_contact  = out_dir / "contact_splat.bin"   # uint32 tokens: (total_frames, latent_h, latent_w) for contact.mp4
+out_joints   = out_dir / "joint_angles.bin"    # float16 joint angles: (total_frames, 4)
 
 # Clean old outputs
-for f in [out_bin, out_actions, out_meta, out_seg, out_contact]:
+for f in [out_bin, out_actions, out_meta, out_seg, out_contact, out_joints]:
     if f.exists():
         f.unlink()
 
@@ -68,6 +78,7 @@ print(f"Cosmos DI8x8 latent grid: ({latent_h}, {latent_w}), token_dim={token_dim
 # Helpers
 # ---------------------------------------
 CHANNELS = ["axis_x", "axis_y", "axis_right_y"]
+JOINT_CHANNELS = ["theta_0", "theta_1", "theta_2", "theta_3"]
 
 def read_joystick_csv(csv_path: Path):
     """Read joystick CSV into (t, X) where t is float64 sim_time, X is (N,3) float64."""
@@ -95,23 +106,64 @@ def read_joystick_csv(csv_path: Path):
     X = np.stack([np.asarray(cols[ch], dtype=np.float64) for ch in CHANNELS], axis=1)
     return t, X  # t: (N,), X: (N,3)
 
-def resample_actions_to_nframes(t_in, X_in, nframes):
+def read_joint_angles_csv(csv_path: Path):
+    """Read joint angles CSV into (t, X) where t is float64 sim_time, X is (N,4) float64."""
+    times = []
+    cols = {k: [] for k in JOINT_CHANNELS}
+    with csv_path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        if "sim_time" not in reader.fieldnames:
+            raise ValueError(f"{csv_path}: missing 'sim_time'")
+        for ch in JOINT_CHANNELS:
+            if ch not in reader.fieldnames:
+                raise ValueError(f"{csv_path}: missing '{ch}'")
+        for row in reader:
+            try:
+                t = float(row["sim_time"])
+                vals = [float(row[ch]) for ch in JOINT_CHANNELS]
+            except Exception:
+                continue
+            times.append(t)
+            for ch, v in zip(JOINT_CHANNELS, vals):
+                cols[ch].append(v)
+    if not times:
+        raise ValueError(f"{csv_path}: no valid rows")
+    t = np.asarray(times, dtype=np.float64)
+    X = np.stack([np.asarray(cols[ch], dtype=np.float64) for ch in JOINT_CHANNELS], axis=1)
+    return t, X  # t: (N,), X: (N,4)
+
+def resample_to_nframes(t_in, X_in, nframes, skip_seconds=0.0, end_seconds=60.0):
     """
-    Resample joystick channels to exactly nframes over sim_time [0, 60].
+    Resample data to exactly nframes over sim_time [skip_seconds, end_seconds].
     Uses linear interpolation; clamps at edges.
-    Returns float16 array of shape (nframes, 3).
+    Returns float16 array of shape (nframes, num_channels).
     """
     if nframes <= 0:
-        return np.empty((0, 3), dtype=np.float16)
-    t_out = np.linspace(0.0, 60.0, nframes, dtype=np.float64)
+        return np.empty((0, X_in.shape[1]), dtype=np.float16)
+    t_out = np.linspace(skip_seconds, end_seconds, nframes, dtype=np.float64)
     out = np.empty((nframes, X_in.shape[1]), dtype=np.float64)
     for j in range(X_in.shape[1]):
         out[:, j] = np.interp(t_out, t_in, X_in[:, j])
     return out.astype(np.float16, copy=False)
 
-def encode_video_to_tokens(video_path: Path, f_tokens) -> int:
+def resample_actions_to_nframes(t_in, X_in, nframes, skip_seconds=0.0):
+    """
+    Resample joystick channels to exactly nframes over sim_time [skip_seconds, 60].
+    Uses linear interpolation; clamps at edges.
+    Returns float16 array of shape (nframes, 3).
+    """
+    if nframes <= 0:
+        return np.empty((0, 3), dtype=np.float16)
+    t_out = np.linspace(skip_seconds, 60.0, nframes, dtype=np.float64)
+    out = np.empty((nframes, X_in.shape[1]), dtype=np.float64)
+    for j in range(X_in.shape[1]):
+        out[:, j] = np.interp(t_out, t_in, X_in[:, j])
+    return out.astype(np.float16, copy=False)
+
+def encode_video_to_tokens(video_path: Path, f_tokens, skip_frames: int = 0) -> int:
     """
     Read frames from video, encode to Cosmos DI8x8 token indices, append to f_tokens.
+    Skips the first `skip_frames` frames.
     Returns the number of frames written.
 
     Each frame (256x256) -> indices [latent_h, latent_w] with latent_h=latent_w=32, stored as uint32.
@@ -123,10 +175,13 @@ def encode_video_to_tokens(video_path: Path, f_tokens) -> int:
 
     n_written = 0
     frames = []
+    frame_idx = 0
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total <= 0:
         total = None  # tqdm without fixed length
+    else:
+        total = max(0, total - skip_frames)  # Adjust total for skipped frames
 
     pbar = tqdm(total=total, desc=f"Encoding {video_path.name}", leave=False)
     try:
@@ -134,6 +189,13 @@ def encode_video_to_tokens(video_path: Path, f_tokens) -> int:
             ret, frame = cap.read()
             if not ret:
                 break
+            
+            # Skip the first skip_frames frames
+            if frame_idx < skip_frames:
+                frame_idx += 1
+                continue
+            frame_idx += 1
+            
             if frame is None or frame.size == 0:
                 pbar.update(1)
                 continue
@@ -191,12 +253,14 @@ exp_dirs = sorted([d for d in root_dir.iterdir() if d.is_dir()])
 with open(out_bin, "ab") as f_tokens, \
      open(out_seg, "ab") as f_seg, \
      open(out_actions, "ab") as f_actions, \
-     open(out_contact, "ab") as f_contact:
+     open(out_contact, "ab") as f_contact, \
+     open(out_joints, "ab") as f_joints:
 
     for exp_idx, exp_dir in enumerate(exp_dirs):
         video_path   = exp_dir / "sensor_img"    / "video.mp4"
         contact_path = exp_dir / "contact_splat" / "contact.mp4"
         action_csv   = exp_dir / "joystick_commands.csv"
+        joints_csv   = exp_dir / "joint_angles.csv"
 
         # Require ALL files per experiment; don't mix or partially write
         missing = []
@@ -206,6 +270,8 @@ with open(out_bin, "ab") as f_tokens, \
             missing.append("contact_splat/contact.mp4")
         if not action_csv.exists():
             missing.append("joystick_commands.csv")
+        if not joints_csv.exists():
+            missing.append("joint_angles.csv")
 
         if missing:
             print(f"Skipping {exp_dir.name}: missing {', '.join(missing)}")
@@ -213,15 +279,15 @@ with open(out_bin, "ab") as f_tokens, \
 
         print(f"🎥 Processing {exp_dir.name}")
 
-        # 1) Encode main video -> tokens
+        # 1) Encode main video -> tokens (skip first SKIP_FRAMES frames)
         start = total_frames
-        nframes = encode_video_to_tokens(video_path, f_tokens)
+        nframes = encode_video_to_tokens(video_path, f_tokens, skip_frames=SKIP_FRAMES)
         if nframes <= 0:
             print(f"  ⚠️ No frames written for {exp_dir.name} (video.mp4), skipping.")
             continue
 
-        # 1b) Encode contact_splat/contact.mp4 -> tokens
-        nframes_contact = encode_video_to_tokens(contact_path, f_contact)
+        # 1b) Encode contact_splat/contact.mp4 -> tokens (skip first SKIP_FRAMES frames)
+        nframes_contact = encode_video_to_tokens(contact_path, f_contact, skip_frames=SKIP_FRAMES)
         if nframes_contact <= 0:
             raise ValueError(f"{exp_dir.name}: contact_splat/contact.mp4 produced no frames")
         if nframes_contact != nframes:
@@ -241,10 +307,22 @@ with open(out_bin, "ab") as f_tokens, \
             # Under your data contract, treat this as fatal rather than silently misaligning data.
             raise
 
-        Y = resample_actions_to_nframes(t_js, X_js, nframes)  # (nframes,3) float16
+        # Skip the first SKIP_FRAMES frames worth of time (at 25 Hz = SKIP_FRAMES/25 seconds)
+        skip_seconds = SKIP_FRAMES / 25.0
+        Y = resample_actions_to_nframes(t_js, X_js, nframes, skip_seconds=skip_seconds)  # (nframes,3) float16
         Y.tofile(f_actions)
 
-        # 4) Record metadata entry
+        # 4) Read & resample joint angles to nframes, then append (float16)
+        try:
+            t_jt, X_jt = read_joint_angles_csv(joints_csv)
+        except Exception as e:
+            print(f"  ❌ Failed to read joint angles for {exp_dir.name}: {e}")
+            raise
+
+        J = resample_to_nframes(t_jt, X_jt, nframes, skip_seconds=skip_seconds)  # (nframes,4) float16
+        J.tofile(f_joints)
+
+        # 5) Record metadata entry
         metadata["clips"].append({
             "name": exp_dir.name,
             "start": start,
@@ -254,7 +332,7 @@ with open(out_bin, "ab") as f_tokens, \
         total_frames += nframes
         print(
             f"  ✅ Frames: {nframes} | start={start} | latent=({latent_h},{latent_w}) "
-            f"| actions appended | contact_splat encoded"
+            f"| actions appended | joint_angles appended | contact_splat encoded"
         )
 
 # ---------------------------------------
@@ -277,6 +355,7 @@ print(f"\n✅ Done. Total frames: {total_frames}")
 print(f"📦 Tokens          : {out_bin}")
 print(f"📦 Contact splat   : {out_contact}")
 print(f"🎮 Actions         : {out_actions}")
+print(f"🦾 Joint angles    : {out_joints}")
 print(f"🧩 Segments        : {out_seg}")
 print(f"📄 Metadata        : {out_meta}")
 
@@ -287,6 +366,8 @@ print(f"  contact  = np.memmap('{out_contact}', dtype=np.uint32, mode='r', "
       f"shape=({total_frames}, {latent_h}, {latent_w}))")
 print(f"  actions  = np.memmap('{out_actions}', dtype=np.float16, mode='r', "
       f"shape=({total_frames}, 3))")
+print(f"  joints   = np.memmap('{out_joints}', dtype=np.float16, mode='r', "
+      f"shape=({total_frames}, 4))")
 print(f"  seg_ids  = np.memmap('{out_seg}', dtype=np.uint32, mode='r', "
       f"shape=({total_frames},))")
 

@@ -258,7 +258,7 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
     decode_latents = decode_latents_wrapper()  # re-initializing every time to save memory
     if accelerator.is_main_process:
         lpips_alex = lpips.LPIPS(net="alex")  # Calculate LPIPS w/ AlexNet, the fastest option
-        metrics = {"ar_lpips": [], "ar_contact_lpips": []}
+        metrics = {"ar_lpips": [], "ar_contact_lpips": [], "ar_joint_mse": []}
 
     latent_side_len = metadata["s"]
 
@@ -276,14 +276,22 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
             full_actions = batch["actions"][:4].to(accelerator.device)  # (4, window_size, 3)
         else:
             full_actions = None
+        
+        # Extract joint angles if available
+        if "joint_angles" in batch:
+            full_joint_angles = batch["joint_angles"][:4].to(accelerator.device)  # (4, window_size, 4)
+        else:
+            full_joint_angles = None
 
-        video_outputs, contact_outputs = unwrapped_model.generate(
+        video_outputs, contact_outputs, joint_outputs = unwrapped_model.generate(
             input_ids=prompt_input_ids, 
             attention_mask=torch.ones_like(prompt_input_ids),
             actions=full_actions,  # Pass full actions
+            joint_angles=full_joint_angles,  # Pass joint angles
             max_new_tokens=num_new_tokens, 
             min_new_tokens=num_new_tokens,
             return_contact=True,
+            return_joints=True,
         )
         
         # Process video tokens
@@ -330,18 +338,33 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
             decoded_contact_output = accelerator.gather(decoded_contact_output.to(accelerator.device)).cpu()
             decoded_contact_gtruth = accelerator.gather(decoded_contact_gtruth.to(accelerator.device)).cpu()
 
+        # Check if we have joint angles
+        has_joints = "joint_angles" in batch and joint_outputs is not None
+        if has_joints:
+            gt_joints_all = batch["joint_angles"][:4].cpu()  # (B, T, 4)
+            pred_joints_all = joint_outputs.cpu()  # (B, num_future, 4)
+
         if accelerator.is_main_process:
             exs_per_fig = 4
             num_future_frames = window_size - num_prompt_frames
             
             for j in range(0, len(decoded_output), exs_per_fig):
-                # 4 rows per example: video GT, video pred, contact GT, contact pred
-                nrows = 4 * exs_per_fig if has_contact else 2 * exs_per_fig
+                # Rows per example: video GT, video pred, contact GT, contact pred, joints GT, joints pred
+                if has_contact and has_joints:
+                    rows_per_ex = 6
+                elif has_contact:
+                    rows_per_ex = 4
+                elif has_joints:
+                    rows_per_ex = 4
+                else:
+                    rows_per_ex = 2
+                
+                nrows = rows_per_ex * exs_per_fig
                 fig, axs = plt.subplots(nrows=nrows, ncols=window_size, 
                                         figsize=(3 * window_size, 3 * nrows))
                 
                 for k in range(min(exs_per_fig, len(decoded_output) - j)):
-                    row_offset = k * 4 if has_contact else k * 2
+                    row_offset = k * rows_per_ex
                     
                     # === VIDEO ROWS ===
                     # Context frames (same for both video rows)
@@ -362,23 +385,67 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
                         axs[row_offset + 1, i].axis("off")
                     
                     # === CONTACT ROWS ===
+                    contact_row_offset = 2
                     if has_contact:
                         # Empty cells for context columns
                         for i in range(num_prompt_frames):
-                            for row in range(2, 4):
-                                axs[row_offset + row, i].axis("off")
+                            for row in range(2):
+                                axs[row_offset + contact_row_offset + row, i].axis("off")
                         
                         # Future contact frames
                         for i in range(num_prompt_frames, window_size):
                             frame_idx = i - num_prompt_frames
                             
-                            axs[row_offset + 2, i].imshow(transforms_f.to_pil_image(decoded_contact_gtruth[j + k, frame_idx]))
-                            axs[row_offset + 2, i].set_title("GT Contact")
-                            axs[row_offset + 2, i].axis("off")
+                            axs[row_offset + contact_row_offset, i].imshow(transforms_f.to_pil_image(decoded_contact_gtruth[j + k, frame_idx]))
+                            axs[row_offset + contact_row_offset, i].set_title("GT Contact")
+                            axs[row_offset + contact_row_offset, i].axis("off")
                             
-                            axs[row_offset + 3, i].imshow(transforms_f.to_pil_image(decoded_contact_output[j + k, frame_idx]))
-                            axs[row_offset + 3, i].set_title("Pred Contact")
-                            axs[row_offset + 3, i].axis("off")
+                            axs[row_offset + contact_row_offset + 1, i].imshow(transforms_f.to_pil_image(decoded_contact_output[j + k, frame_idx]))
+                            axs[row_offset + contact_row_offset + 1, i].set_title("Pred Contact")
+                            axs[row_offset + contact_row_offset + 1, i].axis("off")
+                        
+                        contact_row_offset += 2
+                    
+                    # === JOINT ANGLES ROWS ===
+                    if has_joints:
+                        joint_row_offset = contact_row_offset
+                        
+                        # History joint angles (context frames) - show GT
+                        for i in range(num_prompt_frames):
+                            gt_j = gt_joints_all[j + k, i]  # (4,)
+                            joint_text = f"θ0:{gt_j[0]:.2f}\nθ1:{gt_j[1]:.2f}\nθ2:{gt_j[2]:.2f}\nθ3:{gt_j[3]:.2f}"
+                            
+                            axs[row_offset + joint_row_offset, i].text(0.5, 0.5, f"History\n{joint_text}", 
+                                ha='center', va='center', fontsize=7, transform=axs[row_offset + joint_row_offset, i].transAxes)
+                            axs[row_offset + joint_row_offset, i].set_title("GT Joints" if i == 0 else "")
+                            axs[row_offset + joint_row_offset, i].axis("off")
+                            
+                            axs[row_offset + joint_row_offset + 1, i].text(0.5, 0.5, f"History\n{joint_text}", 
+                                ha='center', va='center', fontsize=7, transform=axs[row_offset + joint_row_offset + 1, i].transAxes)
+                            axs[row_offset + joint_row_offset + 1, i].set_title("Pred Joints" if i == 0 else "")
+                            axs[row_offset + joint_row_offset + 1, i].axis("off")
+                        
+                        # Future joint angles - show GT vs Pred
+                        for i in range(num_prompt_frames, window_size):
+                            frame_idx = i - num_prompt_frames
+                            
+                            # Ground truth
+                            gt_j = gt_joints_all[j + k, i]  # (4,)
+                            gt_text = f"θ0:{gt_j[0]:.2f}\nθ1:{gt_j[1]:.2f}\nθ2:{gt_j[2]:.2f}\nθ3:{gt_j[3]:.2f}"
+                            axs[row_offset + joint_row_offset, i].text(0.5, 0.5, gt_text, 
+                                ha='center', va='center', fontsize=7, transform=axs[row_offset + joint_row_offset, i].transAxes,
+                                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.5))
+                            axs[row_offset + joint_row_offset, i].set_title("GT Joints")
+                            axs[row_offset + joint_row_offset, i].axis("off")
+                            
+                            # Predicted
+                            pred_j = pred_joints_all[j + k, frame_idx]  # (4,)
+                            pred_text = f"θ0:{pred_j[0]:.2f}\nθ1:{pred_j[1]:.2f}\nθ2:{pred_j[2]:.2f}\nθ3:{pred_j[3]:.2f}"
+                            axs[row_offset + joint_row_offset + 1, i].text(0.5, 0.5, pred_text, 
+                                ha='center', va='center', fontsize=7, transform=axs[row_offset + joint_row_offset + 1, i].transAxes,
+                                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.5))
+                            axs[row_offset + joint_row_offset + 1, i].set_title("Pred Joints")
+                            axs[row_offset + joint_row_offset + 1, i].axis("off")
 
                 wandb_tracker = accelerator.get_tracker("wandb")
                 wandb_tracker.log({f"vis_{metrics_prefix}_{j}": fig}, commit=False)
@@ -390,6 +457,16 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
             if has_contact:
                 metrics["ar_contact_lpips"].extend(compute_lpips(decoded_contact_gtruth,
                                                                  decoded_contact_output, lpips_alex))
+            
+            # Compute joint angle MSE if available
+            if "joint_angles" in batch and joint_outputs is not None:
+                gt_joints = batch["joint_angles"][:4].to(accelerator.device)
+                gt_joints_future = gt_joints[:, num_prompt_frames:]  # (B, num_future, 4)
+                pred_joints = joint_outputs.to(accelerator.device)  # (B, num_future, 4)
+                
+                # MSE per example
+                joint_mse = ((pred_joints - gt_joints_future) ** 2).mean(dim=(1, 2))  # (B,)
+                metrics["ar_joint_mse"].extend(joint_mse.cpu().tolist())
 
         if step + 1 >= max_steps:
             break

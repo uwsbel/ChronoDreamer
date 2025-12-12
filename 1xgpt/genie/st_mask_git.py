@@ -55,27 +55,40 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             nn.LayerNorm(config.d_model),  # Ensures similar scale to token embeddings
         )
 
+        # Joint angles embedding (history joint angles as input)
+        # Joint angles are 4 floats - normalize and project to d_model
+        self.joint_embed = nn.Sequential(
+            nn.Linear(config.num_joint_channels, config.d_model),
+            nn.LayerNorm(config.d_model),
+        )
+
         cls = FixedMuReadout if config.use_mup else nn.Linear
         self.out_x_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
         
         self.out_contact_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
+        
+        # Joint angles prediction head (future joint angles as output)
+        # Predict 4 continuous values per frame
+        self.out_joints_proj = nn.Linear(config.d_model, config.num_joint_channels)
         
         self.config = config
 
     def embed_with_actions(
         self, 
         x_TS: torch.LongTensor, 
-        actions: torch.FloatTensor
+        actions: torch.FloatTensor,
+        joint_angles: torch.FloatTensor = None
     ) -> torch.FloatTensor:
         """
-        Embed video tokens and prepend action token to each frame.
+        Embed video tokens and prepend action+joint_angles token to each frame.
         
         Args:
             x_TS: (B, T, S) - video token ids
             actions: (B, T, 3) - action vectors for ALL frames
+            joint_angles: (B, T, 4) - joint angle vectors for ALL frames (optional)
             
         Returns:
-            x_TSC: (B, T, S+1, d_model) - with action as first token per frame
+            x_TSC: (B, T, S+1, d_model) - with action+joints as first token per frame
         """
         B, T, S = x_TS.shape
         
@@ -84,10 +97,19 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         
         # Embed and normalize actions: (B, T, d_model)
         action_emb = self.action_embed(actions)
-        action_emb = action_emb.unsqueeze(2)  # (B, T, 1, d_model)
         
-        # Concatenate: [action, video_tokens] for each frame
-        x_TSC = torch.cat([action_emb, video_emb], dim=2)  # (B, T, S+1, d_model)
+        # Embed and normalize joint angles if provided, add to action embedding
+        if joint_angles is not None:
+            joint_emb = self.joint_embed(joint_angles)  # (B, T, d_model)
+            # Combine action and joint embeddings
+            combined_emb = action_emb + joint_emb  # (B, T, d_model)
+        else:
+            combined_emb = action_emb
+        
+        combined_emb = combined_emb.unsqueeze(2)  # (B, T, 1, d_model)
+        
+        # Concatenate: [action+joints, video_tokens] for each frame
+        x_TSC = torch.cat([combined_emb, video_emb], dim=2)  # (B, T, S+1, d_model)
         
         return x_TSC
 
@@ -98,9 +120,11 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         attention_mask: torch.LongTensor,
         max_new_tokens: int,
         actions: torch.FloatTensor = None,  # Changed: full actions sequence
+        joint_angles: torch.FloatTensor = None,  # History joint angles
         min_new_tokens: int = None,
-        return_logits: int = False,
+        return_logits: bool = False,
         return_contact: bool = False,
+        return_joints: bool = False,
         maskgit_steps: int = 1,
         temperature: float = 0.0,
     ) -> tuple[torch.LongTensor, torch.FloatTensor]:
@@ -130,6 +154,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                 inputs_masked_THW,
                 timestep,
                 actions=actions,  # Pass full actions
+                joint_angles=joint_angles,  # Pass joint angles
                 maskgit_steps=maskgit_steps,
                 temperature=temperature
             )
@@ -143,30 +168,57 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             contact_tokens = self.generate_contact(
                 inputs_masked_THW, 
                 actions=actions,
+                joint_angles=joint_angles,
                 num_prompt_frames=num_prompt_frames,
                 temperature=temperature
             )
         
+        pred_joints = None
+        if return_joints:
+            pred_joints = self.generate_joints(
+                inputs_masked_THW,
+                actions=actions,
+                joint_angles=joint_angles,
+                num_prompt_frames=num_prompt_frames,
+            )
+        
+        # Build return tuple based on what's requested
+        results = [predicted_video_tokens]
         if return_contact:
-            if return_logits:
-                return predicted_video_tokens, contact_tokens, torch.stack(all_factored_logits, dim=3)
-            else:
-                return predicted_video_tokens, contact_tokens
-        else:
-            if return_logits:
-                return predicted_video_tokens, torch.stack(all_factored_logits, dim=3)
-            else:
-                return predicted_video_tokens
+            results.append(contact_tokens)
+        if return_joints:
+            results.append(pred_joints)
+        if return_logits:
+            results.append(torch.stack(all_factored_logits, dim=3))
+        
+        if len(results) == 1:
+            return results[0]
+        return tuple(results)
 
     @torch.no_grad()
     def generate_contact(
         self,
         video_THW: torch.LongTensor,
         actions: torch.FloatTensor = None,  # Changed: full actions
+        joint_angles: torch.FloatTensor = None,  # Joint angles
         num_prompt_frames: int = None,
         temperature: float = 0.0,
+        return_logits: bool = False,
     ) -> torch.LongTensor:
-        """Generate contact predictions."""
+        """Generate contact predictions.
+        
+        Args:
+            video_THW: (B, T, H, W) video tokens
+            actions: (B, T, 3) actions for all frames
+            joint_angles: (B, T, 4) joint angles for all frames (optional)
+            num_prompt_frames: Number of history frames
+            temperature: Sampling temperature
+            return_logits: If True, also return factored logits
+            
+        Returns:
+            contact_tokens: (B, num_future_frames, H, W) predicted contact tokens
+            factored_logits (optional): (B, factored_vocab_size, num_factored_vocabs, num_future_frames, H, W)
+        """
         bs, t, h, w = video_THW.shape
         num_future_frames = t - num_prompt_frames
         
@@ -180,8 +232,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         
         x_TS = rearrange(video_THW_masked, "B T H W -> B T (H W)")
         
-        # Embed with all actions
-        x_TSC = self.embed_with_actions(x_TS, actions)
+        # Embed with all actions and joint angles
+        x_TSC = self.embed_with_actions(x_TS, actions, joint_angles)
         x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
         
         # Extract video tokens (remove action token)
@@ -218,7 +270,53 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             
             contact_tokens[:, t_idx] = samples_HW
         
+        if return_logits:
+            return contact_tokens, factored_logits
         return contact_tokens
+
+    @torch.no_grad()
+    def generate_joints(
+        self,
+        video_THW: torch.LongTensor,
+        actions: torch.FloatTensor = None,
+        joint_angles: torch.FloatTensor = None,
+        num_prompt_frames: int = None,
+    ) -> torch.FloatTensor:
+        """Generate future joint angle predictions.
+        
+        Args:
+            video_THW: (B, T, H, W) video tokens
+            actions: (B, T, 3) actions for all frames
+            joint_angles: (B, T, 4) joint angles for all frames (history used as input)
+            num_prompt_frames: Number of history frames
+            
+        Returns:
+            pred_joints: (B, num_future_frames, 4) predicted joint angles for future frames
+        """
+        bs, t, h, w = video_THW.shape
+        num_future_frames = t - num_prompt_frames
+        
+        # Handle missing inputs
+        if actions is None:
+            actions = torch.zeros(bs, t, 3, device=video_THW.device, dtype=torch.float32)
+        
+        # MASK future video frames (same as contact generation)
+        video_THW_masked = video_THW.clone()
+        video_THW_masked[:, num_prompt_frames:] = self.mask_token_id
+        
+        x_TS = rearrange(video_THW_masked, "B T H W -> B T (H W)")
+        
+        # Embed with actions and joint angles
+        x_TSC = self.embed_with_actions(x_TS, actions, joint_angles)
+        x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
+        
+        # Use the action token (first token per frame) for joint prediction
+        action_token_emb = x_TSC[:, :, 0, :]  # (B, T, d_model)
+        
+        # Predict joint angles for future frames
+        pred_joints = self.out_joints_proj(action_token_emb[:, num_prompt_frames:])  # (B, num_future, 4)
+        
+        return pred_joints
 
     @staticmethod
     def init_mask(prompt_THW):
@@ -233,6 +331,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         prompt_THW: torch.LongTensor,
         out_t: int,
         actions: torch.FloatTensor = None,  # Changed: full actions
+        joint_angles: torch.FloatTensor = None,  # Joint angles
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         unmask_mode: str = "random",
@@ -249,13 +348,13 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         unmasked = self.init_mask(prompt_THW)
 
-        logits_CTHW = self.compute_logits(prompt_THW, actions)
+        logits_CTHW = self.compute_logits(prompt_THW, actions, joint_angles)
         logits_CHW = logits_CTHW[:, :, out_t]
         orig_logits_CHW = logits_CHW.clone()
         
         for step in tqdm(range(maskgit_steps)):
             if step > 0:
-                logits_CHW = self.compute_logits(prompt_THW, actions)[:, :, out_t]
+                logits_CHW = self.compute_logits(prompt_THW, actions, joint_angles)[:, :, out_t]
         
             factored_logits = rearrange(logits_CHW, "b (num_vocabs vocab_size) h w -> b vocab_size num_vocabs h w",
                                         vocab_size=self.config.factored_vocab_size,
@@ -325,11 +424,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         loss_THW = F.cross_entropy(factored_logits, factored_targets, reduction="none").sum(dim=1)
         acc_THW = (factored_logits.argmax(dim=1) == factored_targets).all(dim=1)
 
-        # Compact debug
-        t_stats = (factored_targets.shape, int(factored_targets.min()), int(factored_targets.max()), len(torch.unique(factored_targets)))
-        l_stats = (loss_THW.min().item(), loss_THW.max().item(), loss_THW[relevant_mask_THW].mean().item())
-        a_stats = (acc_THW[relevant_mask_THW].sum().item(), relevant_mask_THW.sum().item(), acc_THW[relevant_mask_THW].float().mean().item())
-        print(f"[Video] targets={t_stats}, loss(min/max/masked)={l_stats[0]:.2f}/{l_stats[1]:.2f}/{l_stats[2]:.2f}, acc={a_stats[0]}/{a_stats[1]}={a_stats[2]:.4f}", flush=True)
+        # Debug prints removed to avoid torchdynamo/compilation issues.
+        # If you need statistics, log or compute them outside compiled paths.
 
         # Compute the mean masked error.
         # Multiply loss values by mask instead of indexing them, more computationally efficient.
@@ -359,8 +455,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             factored_vocab_size=self.config.factored_vocab_size
         )
 
-        factored_stats = (factored_targets.shape, int(factored_targets.min()), int(factored_targets.max()), len(torch.unique(factored_targets)))
-        print(f"[Contact] targets: shape/min/max/unique={factored_stats}", flush=True)
+        # Debug prints removed to avoid torchdynamo/compilation issues.
 
         # Focal Loss: (1 - p_t)^gamma * CE
         gamma = 0.0
@@ -372,10 +467,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         
         acc_THW = (factored_logits.argmax(dim=1) == factored_targets).all(dim=1)
 
-        # Compact debug
-        l_stats = (loss_THW.min().item(), loss_THW.max().item(), loss_THW[relevant_mask_THW].mean().item())
-        a_stats = (acc_THW[relevant_mask_THW].sum().item(), relevant_mask_THW.sum().item(), acc_THW[relevant_mask_THW].float().mean().item())
-        print(f"[Contact] loss(min/max/masked)={l_stats[0]:.2f}/{l_stats[1]:.2f}/{l_stats[2]:.2f}, acc={a_stats[2]:.4f}", flush=True)
+        # Debug prints removed to avoid torchdynamo/compilation issues.
 
         # Compute the mean masked error
         num_masked_tokens = torch.sum(relevant_mask_THW)
@@ -384,7 +476,31 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         return relevant_loss, relevant_acc
 
-    def compute_logits(self, x_THW, actions=None):  # Changed signature
+    def compute_joint_loss(self, pred_joints_T, target_joints_T, relevant_mask_T):
+        """
+        Compute joint angle prediction loss using MSE.
+        
+        Args:
+            pred_joints_T: (B, T-1, 4) - predicted joint angles for future frames
+            target_joints_T: (B, T-1, 4) - target joint angles for future frames  
+            relevant_mask_T: (B, T-1) - mask indicating which frames were masked
+            
+        Returns:
+            loss: scalar MSE loss over masked frames
+        """
+        # MSE loss per frame: (B, T-1)
+        loss_T = F.mse_loss(pred_joints_T, target_joints_T, reduction="none").mean(dim=-1)
+        
+        # Compute mean over masked frames
+        num_masked_frames = torch.sum(relevant_mask_T)
+        if num_masked_frames > 0:
+            relevant_loss = torch.sum(loss_T * relevant_mask_T) / num_masked_frames
+        else:
+            relevant_loss = torch.tensor(0.0, device=pred_joints_T.device)
+        
+        return relevant_loss
+
+    def compute_logits(self, x_THW, actions=None, joint_angles=None):  # Changed signature
         x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
         
         # Handle missing actions
@@ -392,8 +508,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             actions = torch.zeros(x_THW.size(0), x_THW.size(1), 3, 
                                   device=x_THW.device, dtype=torch.float32)
         
-        # Embed with actions
-        x_TSC = self.embed_with_actions(x_TS, actions)
+        # Embed with actions and joint angles
+        x_TSC = self.embed_with_actions(x_TS, actions, joint_angles)
         x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
         
         # Extract video tokens (remove action token)
@@ -403,7 +519,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
         return logits_CTHW
 
-    def forward(self, input_ids, labels, actions=None, contact_labels=None, **kwargs):
+    def forward(self, input_ids, labels, actions=None, contact_labels=None, joint_angles=None, **kwargs):
         T, H, W = self.config.T, self.h, self.w
         x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
         x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
@@ -413,8 +529,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             actions = torch.zeros(input_ids.size(0), T, 3, 
                                   device=input_ids.device, dtype=torch.float32)
         
-        # Embed with actions
-        x_TSC = self.embed_with_actions(x_TS, actions)
+        # Embed with actions and joint angles (history joint angles as input)
+        x_TSC = self.embed_with_actions(x_TS, actions, joint_angles)
         x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
         
         # Extract video tokens (remove action token)
@@ -442,13 +558,31 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                 contact_logits_future, contact_labels_future, relevant_mask
             )
         
+        # Predict future joint angles
+        joint_loss = torch.tensor(0.0, device=input_ids.device)
+        if joint_angles is not None:
+            # Use the action token embedding (first token per frame) for joint prediction
+            # x_TSC[:, :, 0, :] is the action+joint embedding, use that for prediction
+            action_token_emb = x_TSC[:, :, 0, :]  # (B, T, d_model)
+            
+            # Predict joint angles for future frames (skip first frame)
+            pred_joints = self.out_joints_proj(action_token_emb[:, 1:])  # (B, T-1, 4)
+            target_joints = joint_angles[:, 1:]  # (B, T-1, 4)
+            
+            # Create frame-level mask from token mask (any masked token in frame -> frame is masked)
+            relevant_mask_T = relevant_mask.any(dim=(2, 3))  # (B, T-1)
+            
+            joint_loss = self.compute_joint_loss(pred_joints, target_joints, relevant_mask_T)
+        
         contact_weight = getattr(self.config, 'contact_loss_weight', 1.0)
-        total_loss = video_loss + contact_weight * contact_loss
+        joint_weight = getattr(self.config, 'joint_loss_weight', 1.0)
+        total_loss = video_loss + contact_weight * contact_loss + joint_weight * joint_loss
 
         return ModelOutput(
             loss=total_loss, 
             video_loss=video_loss,
             contact_loss=contact_loss,
+            joint_loss=joint_loss,
             acc=video_acc,
             contact_acc=contact_acc,
             logits=logits_CTHW
