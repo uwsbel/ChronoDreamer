@@ -53,25 +53,29 @@ class RobotArmInverseKinematicsSolver:
 
 
     # Inverse kinematics solver
-    def inverse_kinematics_solver(self, target_position, initial_guess, tolerance=1e-6):
-        print("initial guess:", initial_guess)
+    def inverse_kinematics_solver(self, target_position, initial_guess, tolerance=1e-6, verbose=True):
+        if verbose:
+            print("initial guess:", initial_guess)
         result = minimize(self.objective_function, initial_guess, args=(target_position,),
                         method='BFGS', options={'gtol': 1e-8, 'maxiter': 1000})
         
-        print('Optimization result:', result)
+        if verbose:
+            print('Optimization result:', result)
         
         final_position = self.forward_kinematics(result.x)  # Assuming you have this function
         error = np.linalg.norm(final_position - target_position)
         
         if error <= tolerance:
-            print(f"Solution found with error: {error}")
+            if verbose:
+                print(f"Solution found with error: {error}")
             return result.x
         else:
-            print(f"Optimization failed. Message: {result.message}")
-            print(f"Final position error: {error}")
-            print(f"Number of iterations: {result.nit}")
-            print(f"Final position: {final_position}")
-            print(f"Target position: {target_position}")
+            if verbose:
+                print(f"Optimization failed. Message: {result.message}")
+                print(f"Final position error: {error}")
+                print(f"Number of iterations: {result.nit}")
+                print(f"Final position: {final_position}")
+                print(f"Target position: {target_position}")
             raise ValueError("Inverse kinematics solver did not converge")
 
 if __name__ == '__main__':
