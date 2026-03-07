@@ -524,7 +524,8 @@ cam = sens.ChCameraSensor(
     offset_pose,            # offset pose
     image_width,            # image width
     image_height,           # image height
-    fov                    # camera's horizontal field of view
+    fov,                    # camera's horizontal field of view
+    2  # No supersampling for sensor rendering
 )
 cam.SetName("Camera Sensor")
 cam.SetLag(lag)

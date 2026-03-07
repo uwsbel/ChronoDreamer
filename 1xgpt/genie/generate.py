@@ -78,6 +78,10 @@ def parse_args():
         "--generate_joints", action="store_true",
         help="If True, also generate and save joint angle predictions for future frames."
     )
+    parser.add_argument(
+        "--skip_ground_truth", action="store_true",
+        help="If True, do NOT include ground truth frames in output. Use for simulation mode where we don't have ground truth."
+    )
 
     return parser.parse_args()
 
@@ -162,13 +166,21 @@ def main():
     # Stack predicted frames: (B, num_future_frames, H, W)
     predicted_future = torch.stack(samples, dim=1)
     
-    # Build output: [prompt_frames, predicted_frames, ground_truth_future_frames]
+    # Build output: [prompt_frames, predicted_frames, (optional) ground_truth_future_frames]
     # This layout allows comic-strip visualization with GT comparison
-    outputs = torch.cat([
-        example_THW[:, :args.num_prompt_frames],  # History (prompt)
-        predicted_future,                          # Predicted future
-        example_THW[:, args.num_prompt_frames:],  # Ground truth future (for comparison)
-    ], dim=1)
+    if args.skip_ground_truth:
+        # Simulation mode: no ground truth available, just output prompt + predictions
+        outputs = torch.cat([
+            example_THW[:, :args.num_prompt_frames],  # History (prompt)
+            predicted_future,                          # Predicted future
+        ], dim=1)
+    else:
+        # Normal mode: include ground truth for comparison
+        outputs = torch.cat([
+            example_THW[:, :args.num_prompt_frames],  # History (prompt)
+            predicted_future,                          # Predicted future
+            example_THW[:, args.num_prompt_frames:],  # Ground truth future (for comparison)
+        ], dim=1)
 
     # Write video tokens to output
     output_dir = Path(args.output_dir)
@@ -243,6 +255,11 @@ def main():
 
     # Save metadata
     num_future_frames = args.window_size - args.num_prompt_frames
+    if args.skip_ground_truth:
+        layout = "[prompt_frames, predicted_frames]"
+    else:
+        layout = "[prompt_frames, predicted_frames, ground_truth_future_frames]"
+    
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(vars(args) | val_dataset.metadata | {
             "num_images": outputs.shape[1],
@@ -252,7 +269,8 @@ def main():
             "num_prompt_frames": args.num_prompt_frames,
             "num_future_frames": num_future_frames,
             "stride": args.stride,
-            "layout": "[prompt_frames, predicted_frames, ground_truth_future_frames]",
+            "layout": layout,
+            "has_ground_truth": not args.skip_ground_truth,
         }, f, indent=2)
     print(f"Saved metadata to {output_dir / 'metadata.json'}")
 

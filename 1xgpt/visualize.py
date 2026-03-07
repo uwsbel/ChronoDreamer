@@ -190,6 +190,7 @@ def main():
         metadata = json.load(f)
     
     is_generated_data = all(key in metadata for key in ("num_prompt_frames", "window_size"))
+    has_ground_truth = metadata.get("has_ground_truth", True)  # Default to True for backwards compatibility
     
     # Load video tokens directly (bypassing RawTokenDataset to avoid contact shape mismatch)
     video_path = os.path.join(args.token_dir, "video.bin")
@@ -197,8 +198,12 @@ def main():
     s = metadata["s"]
     
     if is_generated_data:
-        # Generated data: [prompt | predicted | ground_truth]
-        num_video_frames = metadata["window_size"] * 2 - metadata["num_prompt_frames"]
+        if has_ground_truth:
+            # Generated data with GT: [prompt | predicted | ground_truth]
+            num_video_frames = metadata["window_size"] * 2 - metadata["num_prompt_frames"]
+        else:
+            # Generated data without GT: [prompt | predicted]
+            num_video_frames = metadata["window_size"]
     else:
         num_video_frames = metadata["num_images"]
     
@@ -209,8 +214,13 @@ def main():
     output_gif_path = os.path.join(args.token_dir, f"generated_offset{args.offset}.gif")
 
     if is_generated_data:
-        if video_tokens.shape[0] != metadata["window_size"] * 2 - metadata["num_prompt_frames"]:
-            raise ValueError(f"Unexpected {video_tokens.shape=} given {metadata['window_size']=}, {metadata['num_prompt_frames']=}")
+        if has_ground_truth:
+            expected_frames = metadata["window_size"] * 2 - metadata["num_prompt_frames"]
+        else:
+            expected_frames = metadata["window_size"]
+        
+        if video_tokens.shape[0] != expected_frames:
+            raise ValueError(f"Unexpected {video_tokens.shape=} given {metadata['window_size']=}, {metadata['num_prompt_frames']=}, {has_ground_truth=}")
 
         captioned_frames = []
         for i, frame in enumerate(video_frames):
@@ -239,8 +249,10 @@ def main():
             # Load it directly with the correct shape instead of using RawTokenDataset
             if is_generated_data:
                 num_future_frames = metadata["window_size"] - metadata["num_prompt_frames"]
-                # Contact structure: [predicted (num_future) | ground_truth (num_future)]
-                num_contact_frames = num_future_frames * 2
+                if has_ground_truth:
+                    num_contact_frames = num_future_frames * 2
+                else:
+                    num_contact_frames = num_future_frames
                 contact_shape = (num_contact_frames, metadata["s"], metadata["s"])
             else:
                 # For training/raw data, contact has same shape as video
@@ -255,13 +267,16 @@ def main():
             contact_gif_path = os.path.join(args.token_dir, f"contact_offset{args.offset}.gif")
             
             if is_generated_data:
-                # Contact has [predicted | ground_truth] (no prompt frames)
+                # Contact has [predicted] or [predicted | ground_truth] (no prompt frames)
                 captioned_contact = []
                 for i, frame in enumerate(contact_frames):
-                    if i < num_future_frames:
+                    if not has_ground_truth:
                         caption = "Contact: Generated"
                     else:
-                        caption = "Contact: GT"
+                        if i < num_future_frames:
+                            caption = "Contact: Generated"
+                        else:
+                            caption = "Contact: GT"
                     captioned_contact.append(caption_image(frame, caption))
             else:
                 captioned_contact = [caption_image(f, "Contact") for f in contact_frames]
@@ -295,15 +310,16 @@ def main():
                     contact_frame = captioned_contact[contact_idx]
                     combined = create_side_by_side_frame(video_frame, contact_frame)
                     combined_frames.append(combined)
-                
-                # Part 3: Ground truth frames (video gt | contact gt)
-                for i in range(num_future_frames):
-                    video_idx = metadata["window_size"] + i
-                    contact_idx = num_future_frames + i  # Contact GT starts at num_future_frames
-                    video_frame = captioned_frames[video_idx]
-                    contact_frame = captioned_contact[contact_idx]
-                    combined = create_side_by_side_frame(video_frame, contact_frame)
-                    combined_frames.append(combined)
+
+                if has_ground_truth:
+                    # Part 3: Ground truth frames (video gt | contact gt)
+                    for i in range(num_future_frames):
+                        video_idx = metadata["window_size"] + i
+                        contact_idx = num_future_frames + i  # Contact GT starts at num_future_frames
+                        video_frame = captioned_frames[video_idx]
+                        contact_frame = captioned_contact[contact_idx]
+                        combined = create_side_by_side_frame(video_frame, contact_frame)
+                        combined_frames.append(combined)
                 
                 combined_gif_path = os.path.join(args.token_dir, f"combined_offset{args.offset}.gif")
                 export_to_gif(combined_frames, combined_gif_path, args.fps)
@@ -318,22 +334,36 @@ def main():
             print("Warning: Comic generation skipped - metadata missing 'window_size' or 'num_prompt_frames'. "
                   "Use --disable_comic for raw dataset visualization.")
         else:
-            # Determine number of rows based on whether we have contact
+            # Determine number of rows based on whether we have contact and ground truth
             has_contact = args.visualize_contact and contact_frames is not None
-            nrows = 4 if has_contact else 2
+            
+            if has_ground_truth:
+                # With GT: 2 rows for video (prediction + GT), optionally 2 more for contact
+                nrows = 4 if has_contact else 2
+            else:
+                # Without GT: 1 row for video, optionally 1 more for contact
+                nrows = 2 if has_contact else 1
             
             fig, axs = plt.subplots(nrows=nrows, ncols=metadata["window_size"], 
                                     figsize=(3 * metadata["window_size"], 3 * nrows))
             
+            # Ensure axs is always 2D for consistency
+            if nrows == 1:
+                axs = axs.reshape(1, -1)
+            
             for i, image in enumerate(video_frames):
                 if i < metadata["num_prompt_frames"]:
-                    curr_axs = [axs[0, i], axs[1, i]]
+                    if has_ground_truth:
+                        curr_axs = [axs[0, i], axs[1, i]]
+                    else:
+                        curr_axs = [axs[0, i]]
                     title = "Prompt"
 
                 elif i < metadata["window_size"]:
                     curr_axs = [axs[0, i]]
                     title = "Prediction"
                 else:
+                    # Ground truth (only when has_ground_truth is True)
                     curr_axs = [axs[1, i - metadata["window_size"] + metadata["num_prompt_frames"]]]
                     title = "Ground truth"
 
@@ -343,29 +373,34 @@ def main():
                     ax.axis("off")
             
             # Add contact rows if available
-            # Note: Contact has [predicted | ground_truth] format (no prompt frames)
+            # Note: Contact has [predicted] or [predicted | ground_truth] format (no prompt frames)
             if has_contact:
                 num_future_frames = metadata["window_size"] - metadata["num_prompt_frames"]
                 
+                # Row indices for contact depend on whether we have ground truth
+                contact_pred_row = 2 if has_ground_truth else 1
+                contact_gt_row = 3 if has_ground_truth else None
+                
                 # Leave prompt columns empty for contact rows
                 for i in range(metadata["num_prompt_frames"]):
-                    axs[2, i].axis("off")
-                    axs[3, i].axis("off")
+                    axs[contact_pred_row, i].axis("off")
+                    if contact_gt_row is not None:
+                        axs[contact_gt_row, i].axis("off")
                 
                 # Plot contact frames starting at num_prompt_frames column
                 for i, frame in enumerate(contact_frames):
                     if i < num_future_frames:
-                        # Predicted contact - goes in row 2, columns after prompt
+                        # Predicted contact
                         col_idx = metadata["num_prompt_frames"] + i
-                        axs[2, col_idx].set_title("Contact: Pred")
-                        axs[2, col_idx].imshow(frame)
-                        axs[2, col_idx].axis("off")
-                    else:
-                        # Ground truth contact - goes in row 3, columns after prompt
+                        axs[contact_pred_row, col_idx].set_title("Contact: Pred")
+                        axs[contact_pred_row, col_idx].imshow(frame)
+                        axs[contact_pred_row, col_idx].axis("off")
+                    elif contact_gt_row is not None:
+                        # Ground truth contact (only if we have video GT)
                         col_idx = metadata["num_prompt_frames"] + (i - num_future_frames)
-                        axs[3, col_idx].set_title("Contact: GT")
-                        axs[3, col_idx].imshow(frame)
-                        axs[3, col_idx].axis("off")
+                        axs[contact_gt_row, col_idx].set_title("Contact: GT")
+                        axs[contact_gt_row, col_idx].imshow(frame)
+                        axs[contact_gt_row, col_idx].axis("off")
 
             output_comic_path = os.path.join(args.token_dir, f"generated_comic_offset{args.offset}.png")
             plt.savefig(output_comic_path, bbox_inches="tight")

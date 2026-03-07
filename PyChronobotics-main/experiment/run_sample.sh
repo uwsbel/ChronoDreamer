@@ -5,7 +5,7 @@ for i in $(seq 1 200); do
     mkdir -p "$folder/sensor_img"
 
     # Run Python script
-    python3 jz_robotiq_push_contact_1.py --output-dir "$folder"
+    python3 jz_robotiq_push_contact.py --output-dir "$folder"
 
     # Enter the sensor_img folder, run mogrify, then return
     if [ -d "$folder/sensor_img" ]; then

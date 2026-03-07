@@ -12,10 +12,17 @@ import pychrono.fea as fea
 import subprocess
 import json
 import time
+import base64
+import io
+import urllib.request
+import urllib.error
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 import re
 import copy
+
+from wm_llm_world_model import WorldModelRunner, _gemini_list_models
 
 try:
     from PIL import Image
@@ -28,394 +35,6 @@ except Exception:
     imageio = None
 cam_pos_global = None
 system_global = None
-
-
-class WorldModelRunner:
-    def __init__(
-        self,
-        output_root: str,
-        camera_dir: str,
-        checkpoint_dir: str,
-        start_time: float = 10.0,
-        period: float = 5.0,
-        stride: int = 15,
-        venv_python: Optional[str] = None,
-    ):
-        self.output_root = Path(output_root).resolve()
-        self.camera_dir = Path(camera_dir).resolve()
-        self.checkpoint_dir = checkpoint_dir
-        self.start_time = float(start_time)
-        self.period = float(period)
-        self.stride = int(stride)
-        self.next_time = float(start_time)
-        self.proc = None
-        self._planned_actions = None
-        self._planned_action_idx = 0
-        self._pending_runs = []
-        self._walltime_start = time.time()
-        self._camera_mtime_floor = self._walltime_start - 5.0
-
-        self.chronodreamer_root = Path(__file__).resolve().parents[2]
-        self.one_xgpt_dir = self.chronodreamer_root / "1xgpt"
-        self.inference_script = self.one_xgpt_dir / "inference_from_sim.py"
-
-        if venv_python is None:
-            venv_python = str(self.one_xgpt_dir / "venv" / "bin" / "python")
-        self.venv_python = venv_python
-
-        self.output_root.mkdir(parents=True, exist_ok=True)
-
-    def pop_next_planned_action(self):
-        if self._planned_actions is None:
-            return None
-        if self._planned_action_idx >= len(self._planned_actions):
-            self._planned_actions = None
-            self._planned_action_idx = 0
-            return None
-        a = self._planned_actions[self._planned_action_idx]
-        self._planned_action_idx += 1
-        return a
-
-    def _read_gif_frames(self, gif_path: Path):
-        if not gif_path.exists():
-            return None
-        if imageio is None:
-            return None
-        try:
-            frames = imageio.mimread(str(gif_path))
-            return frames
-        except Exception:
-            return None
-
-    def _write_gif(self, frames, out_path: Path, fps: int = 2):
-        if not frames:
-            return
-        duration_ms = int(round(1000.0 / float(fps)))
-        if Image is not None:
-            pil_frames = []
-            for fr in frames:
-                if isinstance(fr, np.ndarray):
-                    pil_frames.append(Image.fromarray(fr))
-                else:
-                    pil_frames.append(fr)
-            pil_frames[0].save(
-                str(out_path),
-                format="GIF",
-                append_images=pil_frames[1:],
-                save_all=True,
-                duration=duration_ms,
-                loop=0,
-            )
-            return
-        if imageio is not None:
-            imageio.mimsave(str(out_path), frames, duration=duration_ms / 1000.0)
-
-    def _maybe_finalize_pending(self):
-        if not self._pending_runs:
-            return
-        image_files = self._list_image_files()
-        if not image_files:
-            return
-        remaining = []
-        for item in self._pending_runs:
-            run_dir = item.get("run_dir")
-            window_inds = item.get("window_inds")
-            if run_dir is None or window_inds is None:
-                continue
-            max_ind = int(max(window_inds))
-            if max_ind >= len(image_files):
-                remaining.append(item)
-                continue
-            pred_gif = Path(run_dir) / "generated_offset0.gif"
-            pred_frames = self._read_gif_frames(pred_gif)
-            if pred_frames is None:
-                remaining.append(item)
-                continue
-            gt_gif = Path(run_dir) / "ground_truth_offset0.gif"
-            combo_gif = Path(run_dir) / "gt_vs_pred_offset0.gif"
-            if combo_gif.exists() and gt_gif.exists():
-                continue
-            gt_frames = []
-            try:
-                for idx in window_inds:
-                    gt_frames.append(self._load_rgb(image_files[int(idx)]))
-            except Exception:
-                remaining.append(item)
-                continue
-            self._write_gif(gt_frames, gt_gif, fps=2)
-            if Image is None:
-                remaining.append(item)
-                continue
-            combo_frames = []
-            for i in range(min(len(gt_frames), len(pred_frames))):
-                left = Image.fromarray(gt_frames[i])
-                right = Image.fromarray(pred_frames[i])
-                h = max(left.size[1], right.size[1])
-                if left.size[1] != h:
-                    padded = Image.new("RGB", (left.size[0], h), "white")
-                    padded.paste(left, (0, h - left.size[1]))
-                    left = padded
-                if right.size[1] != h:
-                    padded = Image.new("RGB", (right.size[0], h), "white")
-                    padded.paste(right, (0, h - right.size[1]))
-                    right = padded
-                combined = Image.new("RGB", (left.size[0] + right.size[0], h), "white")
-                combined.paste(left, (0, 0))
-                combined.paste(right, (left.size[0], 0))
-                combo_frames.append(combined)
-            self._write_gif(combo_frames, combo_gif, fps=2)
-        self._pending_runs = remaining
-
-    def _list_image_files(self) -> List[str]:
-        if not self.camera_dir.exists():
-            return []
-        exts = (".png", ".jpg", ".jpeg", ".bmp")
-        files = []
-        for f in os.listdir(self.camera_dir):
-            p = self.camera_dir / f
-            if not (os.path.isfile(p) and f.lower().endswith(exts)):
-                continue
-            try:
-                if p.stat().st_mtime < self._camera_mtime_floor:
-                    continue
-            except Exception:
-                continue
-            files.append(f)
-
-        def _key(name: str):
-            m = re.search(r"frame_(\d+)", name)
-            if m is not None:
-                try:
-                    return int(m.group(1))
-                except Exception:
-                    pass
-            base = os.path.basename(name)
-            nums = re.findall(r"\d+", base)
-            if nums:
-                try:
-                    return int(nums[-1])
-                except Exception:
-                    return base
-            return base
-
-        files.sort(key=_key)
-        return [str(self.camera_dir / f) for f in files]
-
-    def _load_rgb(self, path: str) -> np.ndarray:
-        if Image is not None:
-            img = Image.open(path).convert("RGB")
-            if img.size != (256, 256):
-                img = img.resize((256, 256))
-            return np.asarray(img, dtype=np.uint8)
-        if imageio is not None:
-            arr = imageio.imread(path)
-            if arr.ndim == 2:
-                arr = np.stack([arr, arr, arr], axis=-1)
-            if arr.shape[-1] == 4:
-                arr = arr[..., :3]
-            if arr.shape[0] != 256 or arr.shape[1] != 256:
-                raise RuntimeError(f"Unexpected image shape {arr.shape} for {path}")
-            return arr.astype(np.uint8, copy=False)
-        raise RuntimeError("Neither PIL nor imageio is available to load camera frames")
-
-    def maybe_launch(self, sim_time: float, actions_hist: List[np.ndarray], joints_hist: List[np.ndarray]):
-        self._maybe_finalize_pending()
-        if sim_time < self.next_time:
-            return
-
-        if not os.path.isfile(self.venv_python):
-            print(f"World model disabled: venv python not found at {self.venv_python}")
-            self.next_time = sim_time + self.period
-            return
-
-        if not self.inference_script.exists():
-            print(f"World model disabled: inference script not found at {self.inference_script}")
-            self.next_time = sim_time + self.period
-            return
-
-        if self.proc is not None and self.proc.poll() is None:
-            print(f"World model inference still running at t={sim_time:.2f}, skipping t={self.next_time:.2f}")
-            self.next_time += self.period
-            return
-
-        num_prompt = 8
-        window_size = 16
-        num_future = window_size - num_prompt
-        # We only need history up through the last prompt frame. Future frames are masked anyway.
-        needed = (num_prompt - 1) * self.stride + 1
-
-        image_files = self._list_image_files()
-        n = min(len(image_files), len(actions_hist), len(joints_hist))
-        if n < needed:
-            print(f"Not enough history for world model at t={sim_time:.2f}: have {n}, need {needed}")
-            self.next_time += self.period
-            return
-
-        # Prompt window ends at the most recent available frame.
-        prompt_end_idx = n - 1
-        prompt_start_idx = prompt_end_idx - (num_prompt - 1) * self.stride
-        prompt_inds = [prompt_start_idx + i * self.stride for i in range(num_prompt)]
-
-        try:
-            prompt_frames = [self._load_rgb(image_files[i]) for i in prompt_inds]
-        except Exception as e:
-            print(f"Failed to load history frames for world model: {e}")
-            self.next_time += self.period
-            return
-
-        # Future frames are masked by generate.py, so we can use placeholders.
-        last_frame = prompt_frames[-1]
-        frames_np = np.stack(prompt_frames + [last_frame] * num_future, axis=0).astype(np.uint8)
-
-        prompt_actions = [actions_hist[i] for i in prompt_inds]
-        prompt_joints = [joints_hist[i] for i in prompt_inds]
-
-        plan_hz = 25
-        plan_steps = int(round(self.period * plan_hz))
-        ou = globals().get("ou_process", None)
-        if ou is None:
-            self._planned_actions = None
-            self._planned_action_idx = 0
-            last_action = np.array(prompt_actions[-1], dtype=np.float32)
-            planned_actions = [last_action.copy() for _ in range(plan_steps)]
-        else:
-            planned_actions = []
-            for _ in range(plan_steps):
-                a = ou.sample()
-                axis_x_f = float(a[0])
-                axis_y_f = float(a[1])
-                axis_right_y_f = float(a[2])
-                deadzone = 0.1
-                if abs(axis_x_f) < deadzone:
-                    axis_x_f = 0.0
-                if abs(axis_y_f) < deadzone:
-                    axis_y_f = 0.0
-                if abs(axis_right_y_f) < deadzone:
-                    axis_right_y_f = 0.0
-                planned_actions.append(np.array([axis_x_f, axis_y_f, axis_right_y_f], dtype=np.float32))
-            self._planned_actions = planned_actions
-            self._planned_action_idx = 0
-
-        max_needed = self.stride * num_future
-        if len(planned_actions) < max_needed:
-            planned_actions = planned_actions + [planned_actions[-1].copy()] * (max_needed - len(planned_actions))
-        future_actions = [planned_actions[i * self.stride - 1].copy() for i in range(1, num_future + 1)]
-
-        ik = globals().get("IK_solver", None)
-        move_speed = globals().get("movement_speed", None)
-        desired_pos_global = globals().get("desired_position", None)
-        last_j = np.array(prompt_joints[-1], dtype=np.float32)
-        if ik is None or move_speed is None or desired_pos_global is None:
-            future_joints = [last_j.copy() for _ in range(num_future)]
-        else:
-            desired_pos = np.array(desired_pos_global, dtype=np.float64).copy()
-            joint_guess = last_j.astype(np.float64, copy=True)
-            joints_25hz = []
-            printed_ik_error = False
-            for a in planned_actions[:max_needed]:
-                axis_x_f, axis_y_f, axis_right_y_f = [float(x) for x in a]
-                if sim_time > 5:
-                    desired_pos[0] += axis_x_f * float(move_speed)
-                    desired_pos[1] += -axis_y_f * float(move_speed)
-                    desired_pos[2] += -axis_right_y_f * float(move_speed)
-                    desired_pos[0] = float(np.clip(desired_pos[0], -0.4, 0.4))
-                    desired_pos[1] = float(np.clip(desired_pos[1], 0.45, 0.95))
-                    desired_pos[2] = float(np.clip(desired_pos[2], -0.15, 0.3))
-                try:
-                    joint_guess = np.array(
-                        ik.inverse_kinematics_solver(desired_pos, joint_guess),
-                        dtype=np.float64,
-                    )
-                except Exception:
-                    if not printed_ik_error:
-                        print(f"[world_model] IK rollout failed during future joint forecast at t={sim_time:.2f}")
-                        printed_ik_error = True
-                joints_25hz.append(joint_guess.astype(np.float32, copy=True))
-            future_joints = [joints_25hz[i * self.stride - 1].copy() for i in range(1, num_future + 1)]
-
-        actions_np = np.stack(prompt_actions + future_actions, axis=0).astype(np.float32)
-        actions_np = np.clip(actions_np, -1.0, 1.0)
-        joints_np = np.stack(prompt_joints + future_joints, axis=0).astype(np.float32)
-
-        run_dir = (self.output_root / f"t_{int(round(self.next_time))}s").resolve()
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            window_inds = [prompt_start_idx + i * self.stride for i in range(window_size)]
-            prompt_meta = []
-            for i in prompt_inds:
-                p = image_files[int(i)]
-                entry = {"idx": int(i), "path": str(p)}
-                try:
-                    entry["mtime"] = float(Path(p).stat().st_mtime)
-                except Exception:
-                    pass
-                cam_csv = self.camera_dir.parent / "camera" / f"camera_{int(i):04d}.csv"
-                if cam_csv.exists():
-                    try:
-                        lines = cam_csv.read_text().splitlines()
-                        if len(lines) >= 2:
-                            vals = lines[1].split(",")
-                            if vals:
-                                entry["camera_sim_time"] = float(vals[0])
-                    except Exception:
-                        pass
-                prompt_meta.append(entry)
-
-            debug = {
-                "sim_time": float(sim_time),
-                "stride": int(self.stride),
-                "num_prompt_frames": int(num_prompt),
-                "window_size": int(window_size),
-                "n_used": int(n),
-                "num_images": int(len(image_files)),
-                "num_actions": int(len(actions_hist)),
-                "num_joints": int(len(joints_hist)),
-                "prompt_start_idx": int(prompt_start_idx),
-                "prompt_end_idx": int(prompt_end_idx),
-                "prompt_inds": [int(x) for x in prompt_inds],
-                "window_inds": [int(x) for x in window_inds],
-                "prompt": prompt_meta,
-            }
-            (run_dir / "sampling_debug.json").write_text(json.dumps(debug, indent=2))
-        except Exception:
-            pass
-
-        frames_path = (run_dir / "frames.npy").resolve()
-        actions_path = (run_dir / "actions.npy").resolve()
-        joints_path = (run_dir / "joint_angles.npy").resolve()
-
-        np.save(frames_path, frames_np)
-        np.save(actions_path, actions_np)
-        np.save(joints_path, joints_np)
-
-        window_inds = [prompt_start_idx + i * self.stride for i in range(window_size)]
-        self._pending_runs.append({"run_dir": str(run_dir), "window_inds": window_inds})
-
-        cmd = [
-            self.venv_python,
-            str(self.inference_script),
-            "--frames_path",
-            str(frames_path),
-            "--actions_path",
-            str(actions_path),
-            "--joint_angles_path",
-            str(joints_path),
-            "--output_dir",
-            str(run_dir),
-            "--checkpoint_dir",
-            self.checkpoint_dir,
-        ]
-
-        stdout_path = run_dir / "inference_stdout.txt"
-        stderr_path = run_dir / "inference_stderr.txt"
-        with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
-            env = os.environ.copy()
-            env.pop("PYTHONPATH", None)
-            self.proc = subprocess.Popen(cmd, cwd=str(self.one_xgpt_dir), stdout=out_f, stderr=err_f, env=env)
-
-        print(f"Launched world model inference for t={self.next_time:.2f} -> {run_dir}")
-        self.next_time += self.period
 
 class RayCaster:
 
@@ -543,7 +162,7 @@ class ContactReporter (chrono.ReportContactCallback):
         self.contact_count = 0  # Add counter
         self.contacts_data = []  # Store contact data for batch writing
         self.output_dir = output_dir
-        self.frame_number = 0  # Track frame number for filename
+        self.frame_number = 0  # Track frame number for file naming / bookkeeping
         self.total_contacts_seen = 0  # Track all contacts seen
         self.matched_contacts = 0  # Track contacts that match items_of_interest
         self.partial_matches = 0  # Track contacts where only one object matches
@@ -565,10 +184,9 @@ class ContactReporter (chrono.ReportContactCallback):
         except Exception:
             pass
         
-        # Create contacts subdirectory if output_dir provided
+        self.contacts_csv_filename = None
         if self.output_dir:
-            self.contacts_dir = os.path.join(self.output_dir, 'contacts')
-            os.makedirs(self.contacts_dir, exist_ok=True)
+            self.contacts_csv_filename = os.path.join(self.output_dir, "contacts.csv")
         
         super().__init__()
 
@@ -640,45 +258,18 @@ class ContactReporter (chrono.ReportContactCallback):
     
     def write_contacts_to_csv(self, sim_time):
         """Write all collected contacts to a new CSV file for this frame, filtering by line of sight"""
-        if self.output_dir:
-            # Create filename with zero-padded frame number
-            csv_filename = os.path.join(self.contacts_dir, f"contact_{self.frame_number:04d}.csv")
-            
-            # Filter contacts by line of sight
-            visible_contacts = []
-            for contact in self.contacts_data:
-                #caster = RayCaster(
-                #    self.items_of_interest[0].GetSystem(),
-                #    chrono.ChFramed(chrono.ChVector3d(contact['pA'][0], contact['pA'][1], contact['pA'][2]), 
-                #                    chrono.QuatFromAngleX(-chrono.CH_PI_2)), 
-                #    [2.5, 2.5], 
-                #    0.02
-                #)
-                
-
-                #if caster.has_clear_line_of_sight():
-                if True:  # Temporarily disable occlusion filtering
-                    visible_contacts.append(contact)
-                else:
-                    print(f"   Contact at ({contact['pA'][0]:.3f}, {contact['pA'][1]:.3f}, {contact['pA'][2]:.3f}) OCCLUDED - filtered out")
-            
-            with open(csv_filename, 'w', newline='') as f:
+        if self.contacts_csv_filename is not None:
+            existed = os.path.exists(self.contacts_csv_filename)
+            with open(self.contacts_csv_filename, 'a', newline='') as f:
                 writer = csv.writer(f)
-                # Write header
-                writer.writerow(['sim_time', 'pA_x', 'pA_y', 'pA_z', 
-                               'frc_x', 'frc_y', 'frc_z'])
-                # Write only visible contacts
-                for contact in visible_contacts:
+                if not existed:
+                    writer.writerow(['sim_time', 'pA_x', 'pA_y', 'pA_z', 'frc_x', 'frc_y', 'frc_z'])
+                for contact in self.contacts_data:
                     writer.writerow([
                         sim_time,
                         contact['pA'][0], contact['pA'][1], contact['pA'][2],
                         contact['frc'][0], contact['frc'][1], contact['frc'][2]
                     ])
-            
-            if visible_contacts:
-                print(f"Saved {len(visible_contacts)} visible contacts (out of {len(self.contacts_data)} total) to {csv_filename}")
-            else:
-                print(f"Saved empty contact file ({len(self.contacts_data)} contacts were occluded) to {csv_filename}")
         
         # Print contact statistics every frame
         if self.total_contacts_seen > 0:
@@ -715,7 +306,42 @@ parser.add_argument('--wm-start-time', type=float, default=10.0)
 parser.add_argument('--wm-period', type=float, default=5.0)
 parser.add_argument('--wm-stride', type=int, default=15)
 parser.add_argument('--wm-venv-python', type=str, default=None)
+parser.add_argument('--wm-llm-enable', action='store_true')
+parser.add_argument('--wm-llm-model', type=str, default='gemini-2.5-flash')
+parser.add_argument('--wm-llm-timeout-s', type=float, default=20.0)
+parser.add_argument('--wm-llm-temperature', type=float, default=0.0)
+parser.add_argument('--wm-llm-max-output-tokens', type=int, default=1024)
+parser.add_argument('--wm-llm-max-attempts', type=int, default=3)
+parser.add_argument('--wm-llm-prompt-file', type=str, default=None)
+parser.add_argument('--wm-llm-disable-contact-map', action='store_true')
+parser.add_argument('--wm-llm-reject-confidence', type=float, default=0.9)
+parser.add_argument('--wm-llm-list-models', action='store_true')
+parser.add_argument('--wm-llm-list-models-filter', type=str, default='')
+
+parser.add_argument('--control-action-scale', type=float, default=0.35)
+parser.add_argument('--control-movement-speed', type=float, default=0.003)
+parser.add_argument('--control-deadzone', type=float, default=0.05)
+parser.add_argument('--control-start-time', type=float, default=2.0)
+parser.add_argument('--ou-theta', type=float, default=0.8)
+parser.add_argument('--ou-sigma', type=float, default=0.15)
+parser.add_argument('--ou-dt', type=float, default=0.04)
+parser.add_argument('--ou-min-magnitude', type=float, default=0.0)
 args = parser.parse_args()
+
+if args.wm_llm_list_models:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY")
+    data = _gemini_list_models(api_key)
+    models = data.get("models", []) if isinstance(data, dict) else []
+    flt = (args.wm_llm_list_models_filter or "").lower().strip()
+    for m in models:
+        name = str(m.get("name", ""))
+        if flt and flt not in name.lower():
+            continue
+        methods = m.get("supportedGenerationMethods", [])
+        print(f"{name}  methods={methods}")
+    raise SystemExit(0)
 
 # Create output directory if it doesn't exist
 output_dir = args.output_dir
@@ -744,6 +370,16 @@ if not args.no_world_model:
         period=args.wm_period,
         stride=args.wm_stride,
         venv_python=args.wm_venv_python,
+        llm_enabled=args.wm_llm_enable,
+        llm_model=args.wm_llm_model,
+        llm_timeout_s=args.wm_llm_timeout_s,
+        llm_temperature=args.wm_llm_temperature,
+        llm_max_output_tokens=args.wm_llm_max_output_tokens,
+        llm_max_attempts=args.wm_llm_max_attempts,
+        llm_use_contact_map=not args.wm_llm_disable_contact_map,
+        llm_reject_confidence=args.wm_llm_reject_confidence,
+        llm_prompt_file=args.wm_llm_prompt_file,
+        context_globals=globals(),
     )
 
 print(f"Output directory: {output_dir}")
@@ -810,12 +446,16 @@ class OrnsteinUhlenbeckProcess:
 # For extremely frequent direction changes
 ou_process = OrnsteinUhlenbeckProcess(
     size=3,
-    theta=5.0,     # Extremely high mean reversion = constant direction changes
-    mu=0.0,        
-    sigma=0.5,     # Very high noise for maximum chaos
-    dt=0.04,      # Extremely short time step
-    min_magnitude=0.8
+    theta=float(args.ou_theta),
+    mu=0.0,
+    sigma=float(args.ou_sigma),
+    dt=float(args.ou_dt),
+    min_magnitude=float(args.ou_min_magnitude),
 )
+
+control_action_scale = float(args.control_action_scale)
+control_deadzone = float(args.control_deadzone)
+control_start_time = float(args.control_start_time)
 
 # Initialize pygame and joystick
 pygame.init()
@@ -1311,7 +951,7 @@ rt_timer = chrono.ChRealtimeStepTimer()
 
 # Initialize desired position
 desired_position = np.array([0.0, 0.6, -0.05])  # Starting position
-movement_speed = 0.0075  # m/s per control step
+movement_speed = float(args.control_movement_speed)  # m/s per control step
 
 step_number = 0
 save_img = False
@@ -1409,16 +1049,16 @@ while vis.Run():
             planned = world_model_runner.pop_next_planned_action()
         if planned is None:
             current_ou_sample = ou_process.sample()
-            axis_x = current_ou_sample[0]
-            axis_y = current_ou_sample[1]
-            axis_right_y = current_ou_sample[2]
+            axis_x = float(current_ou_sample[0])
+            axis_y = float(current_ou_sample[1])
+            axis_right_y = float(current_ou_sample[2])
         else:
             axis_x = float(planned[0])
             axis_y = float(planned[1])
             axis_right_y = float(planned[2])
 
         # Apply deadzone to prevent drift
-        deadzone = 0.1
+        deadzone = control_deadzone
         if abs(axis_x) < deadzone:
             axis_x = 0
         if abs(axis_y) < deadzone:
@@ -1426,7 +1066,12 @@ while vis.Run():
         if abs(axis_right_y) < deadzone:
             axis_right_y = 0
 
-        if sim_time > 5:
+        if planned is None:
+            axis_x *= control_action_scale
+            axis_y *= control_action_scale
+            axis_right_y *= control_action_scale
+
+        if sim_time > control_start_time:
             # Update desired position based on joystick input
             # Left stick controls X and Y movement
             desired_position[0] += axis_x * movement_speed  # X movement
