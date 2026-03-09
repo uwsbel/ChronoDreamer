@@ -338,19 +338,6 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
             
             # Predicted contact is already (B, num_future, H, W)
             pred_contact_tokens = contact_outputs.to(accelerator.device)
-            
-            # ============ ADD THIS DEBUG ============
-            print(f"\n=== VISUALIZATION Contact Debug ===")
-            print(f"GT tokens - min: {gtruth_contact_tokens.min()}, max: {gtruth_contact_tokens.max()}, unique: {len(torch.unique(gtruth_contact_tokens))}")
-            print(f"Pred tokens - min: {pred_contact_tokens.min()}, max: {pred_contact_tokens.max()}, unique: {len(torch.unique(pred_contact_tokens))}")
-            
-            # Check if predictions are all the same or very low values
-            if len(torch.unique(pred_contact_tokens)) < 10:
-                print(f"WARNING: Pred tokens have very few unique values!")
-                print(f"  Unique values: {torch.unique(pred_contact_tokens).tolist()[:20]}")
-            # ========================================
-            
-
 
             # Decode contact (same decoder as video)
             decoded_contact_output = decode_tokens(pred_contact_tokens.cpu(), decode_latents)
@@ -362,8 +349,8 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         # Use full GT labels (not the masked input) for joint angle visualization (mode 0/1 only)
         has_joints = want_joints and "joint_angle_labels" in batch and joint_outputs is not None
         if has_joints:
-            gt_joints_all = batch["joint_angle_labels"][:4].cpu()  # (B, T, 4) — full GT
-            pred_joints_all = joint_outputs.cpu()  # (B, num_future, 4)
+            gt_joints_all = accelerator.gather(batch["joint_angle_labels"][:4].to(accelerator.device)).cpu()
+            pred_joints_all = accelerator.gather(joint_outputs.to(accelerator.device)).cpu()
 
         if accelerator.is_main_process:
             exs_per_fig = 4
@@ -479,14 +466,11 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
                 metrics["ar_contact_lpips"].extend(compute_lpips(decoded_contact_gtruth,
                                                                  decoded_contact_output, lpips_alex))
             
-            # Compute joint angle MSE using full GT labels (mode 0/1 only)
-            if want_joints and "joint_angle_labels" in batch and joint_outputs is not None:
-                gt_joints = batch["joint_angle_labels"][:4].to(accelerator.device)
-                gt_joints_future = gt_joints[:, num_prompt_frames:]  # (B, num_future, 4)
-                pred_joints = joint_outputs.to(accelerator.device)  # (B, num_future, 4)
-                
-                joint_mse = ((pred_joints - gt_joints_future) ** 2).mean(dim=(1, 2))  # (B,)
-                metrics["ar_joint_mse"].extend(joint_mse.cpu().tolist())
+            # Compute joint angle MSE using gathered data (mode 0/1 only)
+            if has_joints:
+                gt_joints_future = gt_joints_all[:, num_prompt_frames:]  # (N, num_future, 4)
+                joint_mse = ((pred_joints_all - gt_joints_future) ** 2).mean(dim=(1, 2))  # (N,)
+                metrics["ar_joint_mse"].extend(joint_mse.tolist())
 
         if step + 1 >= max_steps:
             break
