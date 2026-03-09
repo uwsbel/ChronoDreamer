@@ -55,21 +55,23 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             nn.LayerNorm(config.d_model),  # Ensures similar scale to token embeddings
         )
 
-        # Joint angles embedding (history joint angles as input)
-        # Joint angles are 4 floats - normalize and project to d_model
-        self.joint_embed = nn.Sequential(
-            nn.Linear(config.num_joint_channels, config.d_model),
-            nn.LayerNorm(config.d_model),
-        )
+        # Joint angles embedding — only in mode 0 (full) and mode 1 (no contact)
+        if config.mode <= 1:
+            self.joint_embed = nn.Sequential(
+                nn.Linear(config.num_joint_channels, config.d_model),
+                nn.LayerNorm(config.d_model),
+            )
 
         cls = FixedMuReadout if config.use_mup else nn.Linear
         self.out_x_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
-        
-        self.out_contact_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
-        
-        # Joint angles prediction head (future joint angles as output)
-        # Predict 4 continuous values per frame
-        self.out_joints_proj = nn.Linear(config.d_model, config.num_joint_channels)
+
+        # Contact head — only in mode 0 (full)
+        if config.mode == 0:
+            self.out_contact_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
+
+        # Joint prediction head — only in mode 0 (full) and mode 1 (no contact)
+        if config.mode <= 1:
+            self.out_joints_proj = nn.Linear(config.d_model, config.num_joint_channels)
         
         self.config = config
 
@@ -84,8 +86,9 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         
         Args:
             x_TS: (B, T, S) - video token ids
-            actions: (B, T, 3) - action vectors for ALL frames
-            joint_angles: (B, T, 4) - joint angle vectors for ALL frames (optional)
+            actions: (B, T, 3) - action vectors for ALL frames (planned commands, known a priori)
+            joint_angles: (B, T, 4) - joint angle vectors (optional). Future frames should be
+                zeroed out to prevent data leakage — the caller is responsible for masking.
             
         Returns:
             x_TSC: (B, T, S+1, d_model) - with action+joints as first token per frame
@@ -98,10 +101,9 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         # Embed and normalize actions: (B, T, d_model)
         action_emb = self.action_embed(actions)
         
-        # Embed and normalize joint angles if provided, add to action embedding
-        if joint_angles is not None:
+        # Embed and normalize joint angles if provided and mode supports it
+        if joint_angles is not None and self.config.mode <= 1:
             joint_emb = self.joint_embed(joint_angles)  # (B, T, d_model)
-            # Combine action and joint embeddings
             combined_emb = action_emb + joint_emb  # (B, T, d_model)
         else:
             combined_emb = action_emb
@@ -114,13 +116,23 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         return x_TSC
 
 
+    def _mask_future_joint_angles(self, joint_angles, num_prompt_frames, total_frames, device):
+        """Zero out future joint angles so the model never sees GT future state as input."""
+        if joint_angles is None:
+            return None
+        masked = torch.zeros(joint_angles.size(0), total_frames, joint_angles.size(-1),
+                             device=device, dtype=joint_angles.dtype)
+        T_hist = min(joint_angles.size(1), num_prompt_frames)
+        masked[:, :T_hist] = joint_angles[:, :T_hist]
+        return masked
+
     def generate(
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.LongTensor,
         max_new_tokens: int,
-        actions: torch.FloatTensor = None,  # Changed: full actions sequence
-        joint_angles: torch.FloatTensor = None,  # History joint angles
+        actions: torch.FloatTensor = None,
+        joint_angles: torch.FloatTensor = None,
         min_new_tokens: int = None,
         return_logits: bool = False,
         return_contact: bool = False,
@@ -133,6 +145,12 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         assert max_new_tokens % self.config.S == 0
         num_new_frames = max_new_tokens // self.config.S
 
+        # Override flags based on mode
+        if self.config.mode >= 1:
+            return_contact = False
+        if self.config.mode >= 2:
+            return_joints = False
+
         inputs_THW = rearrange(input_ids.clone(), "b (t h w) -> b t h w", h=self.h, w=self.w)
         num_prompt_frames = inputs_THW.size(1)
         
@@ -142,19 +160,26 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                        self.mask_token_id, dtype=torch.long, device=input_ids.device)
         ], dim=1)
 
-        # Handle missing actions
         total_frames = inputs_masked_THW.size(1)
         if actions is None:
             actions = torch.zeros(input_ids.size(0), total_frames, 3, 
                                   device=input_ids.device, dtype=torch.float32)
+
+        # Only keep history joint angles — zero out future to prevent data leakage
+        if self.config.mode <= 1:
+            masked_joint_angles = self._mask_future_joint_angles(
+                joint_angles, num_prompt_frames, total_frames, input_ids.device
+            )
+        else:
+            masked_joint_angles = None
 
         all_factored_logits = []
         for timestep in range(num_prompt_frames, total_frames):
             sample_HW, factored_logits = self.maskgit_generate(
                 inputs_masked_THW,
                 timestep,
-                actions=actions,  # Pass full actions
-                joint_angles=joint_angles,  # Pass joint angles
+                actions=actions,
+                joint_angles=masked_joint_angles,
                 maskgit_steps=maskgit_steps,
                 temperature=temperature
             )
@@ -168,7 +193,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             contact_tokens = self.generate_contact(
                 inputs_masked_THW, 
                 actions=actions,
-                joint_angles=joint_angles,
+                joint_angles=masked_joint_angles,
                 num_prompt_frames=num_prompt_frames,
                 temperature=temperature
             )
@@ -178,11 +203,10 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             pred_joints = self.generate_joints(
                 inputs_masked_THW,
                 actions=actions,
-                joint_angles=joint_angles,
+                joint_angles=masked_joint_angles,
                 num_prompt_frames=num_prompt_frames,
             )
         
-        # Build return tuple based on what's requested
         results = [predicted_video_tokens]
         if return_contact:
             results.append(contact_tokens)
@@ -199,41 +223,31 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
     def generate_contact(
         self,
         video_THW: torch.LongTensor,
-        actions: torch.FloatTensor = None,  # Changed: full actions
-        joint_angles: torch.FloatTensor = None,  # Joint angles
+        actions: torch.FloatTensor = None,
+        joint_angles: torch.FloatTensor = None,
         num_prompt_frames: int = None,
         temperature: float = 0.0,
         return_logits: bool = False,
     ) -> torch.LongTensor:
-        """Generate contact predictions.
-        
-        Args:
-            video_THW: (B, T, H, W) video tokens
-            actions: (B, T, 3) actions for all frames
-            joint_angles: (B, T, 4) joint angles for all frames (optional)
-            num_prompt_frames: Number of history frames
-            temperature: Sampling temperature
-            return_logits: If True, also return factored logits
-            
-        Returns:
-            contact_tokens: (B, num_future_frames, H, W) predicted contact tokens
-            factored_logits (optional): (B, factored_vocab_size, num_factored_vocabs, num_future_frames, H, W)
-        """
+        """Generate contact predictions. Only available in mode 0."""
+        assert self.config.mode == 0, f"generate_contact requires mode 0, got mode {self.config.mode}"
         bs, t, h, w = video_THW.shape
         num_future_frames = t - num_prompt_frames
         
-        # Handle missing actions
         if actions is None:
             actions = torch.zeros(bs, t, 3, device=video_THW.device, dtype=torch.float32)
         
-        # MASK future video frames
+        # Zero out future joint angles to prevent data leakage
+        masked_joint_angles = self._mask_future_joint_angles(
+            joint_angles, num_prompt_frames, t, video_THW.device
+        )
+        
         video_THW_masked = video_THW.clone()
         video_THW_masked[:, num_prompt_frames:] = self.mask_token_id
         
         x_TS = rearrange(video_THW_masked, "B T H W -> B T (H W)")
         
-        # Embed with all actions and joint angles
-        x_TSC = self.embed_with_actions(x_TS, actions, joint_angles)
+        x_TSC = self.embed_with_actions(x_TS, actions, masked_joint_angles)
         x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
         
         # Extract video tokens (remove action token)
@@ -282,32 +296,25 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         joint_angles: torch.FloatTensor = None,
         num_prompt_frames: int = None,
     ) -> torch.FloatTensor:
-        """Generate future joint angle predictions.
-        
-        Args:
-            video_THW: (B, T, H, W) video tokens
-            actions: (B, T, 3) actions for all frames
-            joint_angles: (B, T, 4) joint angles for all frames (history used as input)
-            num_prompt_frames: Number of history frames
-            
-        Returns:
-            pred_joints: (B, num_future_frames, 4) predicted joint angles for future frames
-        """
+        """Generate future joint angle predictions. Only available in mode 0 and 1."""
+        assert self.config.mode <= 1, f"generate_joints requires mode <= 1, got mode {self.config.mode}"
         bs, t, h, w = video_THW.shape
         num_future_frames = t - num_prompt_frames
         
-        # Handle missing inputs
         if actions is None:
             actions = torch.zeros(bs, t, 3, device=video_THW.device, dtype=torch.float32)
         
-        # MASK future video frames (same as contact generation)
+        # Zero out future joint angles to prevent data leakage
+        masked_joint_angles = self._mask_future_joint_angles(
+            joint_angles, num_prompt_frames, t, video_THW.device
+        )
+        
         video_THW_masked = video_THW.clone()
         video_THW_masked[:, num_prompt_frames:] = self.mask_token_id
         
         x_TS = rearrange(video_THW_masked, "B T H W -> B T (H W)")
         
-        # Embed with actions and joint angles
-        x_TSC = self.embed_with_actions(x_TS, actions, joint_angles)
+        x_TSC = self.embed_with_actions(x_TS, actions, masked_joint_angles)
         x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
         
         # Use the action token (first token per frame) for joint prediction
@@ -519,21 +526,25 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
         return logits_CTHW
 
-    def forward(self, input_ids, labels, actions=None, contact_labels=None, joint_angles=None, **kwargs):
+    def forward(self, input_ids, labels, actions=None, contact_labels=None,
+                joint_angles=None, joint_angle_labels=None, **kwargs):
+        """
+        Args:
+            joint_angles: (B, T, 4) — history-only joint angles (future zeroed) used as MODEL INPUT.
+            joint_angle_labels: (B, T, 4) — full GT joint angles used as LOSS TARGET only.
+        """
         T, H, W = self.config.T, self.h, self.w
         x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
         x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
 
-        # Handle missing actions
         if actions is None:
             actions = torch.zeros(input_ids.size(0), T, 3, 
                                   device=input_ids.device, dtype=torch.float32)
         
-        # Embed with actions and joint angles (history joint angles as input)
+        # joint_angles has future frames zeroed out by the collator — safe to embed
         x_TSC = self.embed_with_actions(x_TS, actions, joint_angles)
         x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
         
-        # Extract video tokens (remove action token)
         x_TSC_video = x_TSC[:, :, 1:, :]
         
         video_logits_TSC = self.out_x_proj(x_TSC_video)
@@ -546,7 +557,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         contact_loss = torch.tensor(0.0, device=input_ids.device)
         contact_acc = torch.tensor(0.0, device=input_ids.device)
-        if contact_labels is not None:
+        if self.config.mode == 0 and contact_labels is not None:
             contact_logits_TSC = self.out_contact_proj(x_TSC_video)
             contact_logits_CTHW = rearrange(contact_logits_TSC, "B T (H W) C -> B C T H W", H=H, W=W)
             
@@ -558,18 +569,14 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                 contact_logits_future, contact_labels_future, relevant_mask
             )
         
-        # Predict future joint angles
         joint_loss = torch.tensor(0.0, device=input_ids.device)
-        if joint_angles is not None:
-            # Use the action token embedding (first token per frame) for joint prediction
-            # x_TSC[:, :, 0, :] is the action+joint embedding, use that for prediction
+        joint_targets = joint_angle_labels if joint_angle_labels is not None else joint_angles
+        if self.config.mode <= 1 and joint_targets is not None:
             action_token_emb = x_TSC[:, :, 0, :]  # (B, T, d_model)
             
-            # Predict joint angles for future frames (skip first frame)
             pred_joints = self.out_joints_proj(action_token_emb[:, 1:])  # (B, T-1, 4)
-            target_joints = joint_angles[:, 1:]  # (B, T-1, 4)
+            target_joints = joint_targets[:, 1:]  # (B, T-1, 4) — from labels, not input
             
-            # Create frame-level mask from token mask (any masked token in frame -> frame is masked)
             relevant_mask_T = relevant_mask.any(dim=(2, 3))  # (B, T-1)
             
             joint_loss = self.compute_joint_loss(pred_joints, target_joints, relevant_mask_T)

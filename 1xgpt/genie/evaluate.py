@@ -386,6 +386,16 @@ def main():
     # Load model and create dataloader with proper collator
     model = STMaskGIT.from_pretrained(args.checkpoint_dir)
     config = model.config
+    mode = config.mode
+
+    # Override eval flags based on model mode
+    if mode >= 1 and args.evaluate_contact:
+        print(f"WARNING: Model was trained with mode={mode}, contact head not available. Skipping --evaluate_contact.")
+        args.evaluate_contact = False
+    if mode >= 2 and args.evaluate_joints:
+        print(f"WARNING: Model was trained with mode={mode}, joint head not available. Skipping --evaluate_joints.")
+        args.evaluate_joints = False
+
     collate_fn = get_maskgit_collator(config)
     dataloader = DataLoader(val_dataset, collate_fn=collate_fn, batch_size=args.batch_size, shuffle=False)
 
@@ -408,30 +418,33 @@ def main():
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
         batch_size = batch["input_ids"].size(0)
         
-        # Reshape inputs
-        reshaped_input_ids = rearrange(
-            batch["input_ids"], "b (t h w) -> b t h w", 
+        # Use clean GT labels (not corrupted input_ids) for prompts and ground truth
+        reshaped_labels = rearrange(
+            batch["labels"], "b (t h w) -> b t h w", 
             t=args.window_size, h=args.latent_h, w=args.latent_w
         )
         
         # Get actions and joint angles
         actions = batch.get("actions", None)
+        # joint_angles has future zeroed out (safe for model input)
         joint_angles = batch.get("joint_angles", None)
+        # joint_angle_labels has full GT (for loss/metric computation only)
+        joint_angle_labels = batch.get("joint_angle_labels", joint_angles)
         
         # ==================== VIDEO PREDICTION ====================
         start_time = time.time()
         video_samples, video_logits = evaluator.predict_video_frames(
-            batch["input_ids"],
+            batch["labels"],
             actions=actions,
             joint_angles=joint_angles,
-            ground_truth_THW=reshaped_input_ids if args.teacher_force_time else None,
+            ground_truth_THW=reshaped_labels if args.teacher_force_time else None,
         )
         gen_time = time.time() - start_time
         frames_generated = num_future_frames * batch_size
         metrics["video_gen_time_per_frame"].update(gen_time / frames_generated, batch_size)
         
         # Video token accuracy
-        gt_future_tokens = reshaped_input_ids[:, args.num_prompt_frames:].to(evaluator.device)
+        gt_future_tokens = reshaped_labels[:, args.num_prompt_frames:].to(evaluator.device)
         video_token_acc = (gt_future_tokens == video_samples).float().mean().item()
         metrics["video_token_acc"].update(video_token_acc, batch_size)
         
@@ -466,7 +479,7 @@ def main():
                 
                 # Build full video for contact prediction: [history_gt, predicted_future]
                 full_video = torch.cat([
-                    reshaped_input_ids[:, :args.num_prompt_frames].to(evaluator.device),
+                    reshaped_labels[:, :args.num_prompt_frames].to(evaluator.device),
                     video_samples,
                 ], dim=1)
                 
@@ -506,16 +519,16 @@ def main():
                     outputs_to_save["contact_logits"].append(contact_logits.cpu())
         
         # ==================== JOINT ANGLE PREDICTION ====================
-        if args.evaluate_joints and joint_angles is not None:
-            gt_joints_future = joint_angles[:, args.num_prompt_frames:].to(evaluator.device)  # (B, num_future, 4)
+        if args.evaluate_joints and joint_angle_labels is not None:
+            # Use full GT labels for comparison, NOT the masked input
+            gt_joints_future = joint_angle_labels[:, args.num_prompt_frames:].to(evaluator.device)  # (B, num_future, 4)
             
-            # Build full video for joint prediction: [history_gt, predicted_future]
             full_video = torch.cat([
-                reshaped_input_ids[:, :args.num_prompt_frames].to(evaluator.device),
+                reshaped_labels[:, :args.num_prompt_frames].to(evaluator.device),
                 video_samples,
             ], dim=1)
             
-            # Predict joint angles
+            # Pass masked joint_angles (future zeroed) as model input
             start_time = time.time()
             pred_joints = evaluator.predict_joint_angles(full_video, actions=actions, joint_angles=joint_angles)
             joint_gen_time = time.time() - start_time

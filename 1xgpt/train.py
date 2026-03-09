@@ -224,6 +224,10 @@ def parse_args():
         action="store_true",
         help="If specified, will not compile the model."
     )
+    parser.add_argument(
+        "--mode", type=int, default=0, choices=[0, 1, 2],
+        help="0=full (video+contact+joints), 1=no contact (video+joints), 2=video only"
+    )
 
     args = parser.parse_args()
 
@@ -253,6 +257,7 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
     """
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
+    mode = unwrapped_model.config.mode
 
     metadata = dataloader.dataset.metadata
     decode_latents = decode_latents_wrapper()  # re-initializing every time to save memory
@@ -261,6 +266,8 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         metrics = {"ar_lpips": [], "ar_contact_lpips": [], "ar_joint_mse": []}
 
     latent_side_len = metadata["s"]
+    want_contact = (mode == 0)
+    want_joints = (mode <= 1)
 
     unwrapped_model.eval()
     for step, batch in enumerate(dataloader):
@@ -273,26 +280,40 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         
         # Extract actions if available
         if "actions" in batch:
-            full_actions = batch["actions"][:4].to(accelerator.device)  # (4, window_size, 3)
+            full_actions = batch["actions"][:4].to(accelerator.device)
         else:
             full_actions = None
         
-        # Extract joint angles if available
-        if "joint_angles" in batch:
-            full_joint_angles = batch["joint_angles"][:4].to(accelerator.device)  # (4, window_size, 4)
+        # Extract joint angles if available (only used in mode 0/1)
+        if want_joints and "joint_angles" in batch:
+            full_joint_angles = batch["joint_angles"][:4].to(accelerator.device)
         else:
             full_joint_angles = None
 
-        video_outputs, contact_outputs, joint_outputs = unwrapped_model.generate(
+        gen_results = unwrapped_model.generate(
             input_ids=prompt_input_ids, 
             attention_mask=torch.ones_like(prompt_input_ids),
-            actions=full_actions,  # Pass full actions
-            joint_angles=full_joint_angles,  # Pass joint angles
+            actions=full_actions,
+            joint_angles=full_joint_angles,
             max_new_tokens=num_new_tokens, 
             min_new_tokens=num_new_tokens,
-            return_contact=True,
-            return_joints=True,
+            return_contact=want_contact,
+            return_joints=want_joints,
         )
+
+        # Unpack results based on mode
+        if want_contact and want_joints:
+            video_outputs, contact_outputs, joint_outputs = gen_results
+        elif want_joints:
+            video_outputs, joint_outputs = gen_results
+            contact_outputs = None
+        elif want_contact:
+            video_outputs, contact_outputs = gen_results
+            joint_outputs = None
+        else:
+            video_outputs = gen_results
+            contact_outputs = None
+            joint_outputs = None
         
         # Process video tokens
         output_tokens = rearrange(video_outputs, "b (t h w) -> b t h w", t=window_size,
@@ -306,8 +327,8 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         decoded_output = accelerator.gather(decoded_output.to(accelerator.device)).cpu()
         decoded_gtruth = accelerator.gather(decoded_gtruth.to(accelerator.device)).cpu()
 
-        # Process contact tokens
-        has_contact = "contact_labels" in batch and contact_outputs is not None
+        # Process contact tokens (mode 0 only)
+        has_contact = want_contact and "contact_labels" in batch and contact_outputs is not None
         if has_contact:
             # Ground truth contact - reshape and take future frames
             contact_labels = batch["contact_labels"][:4].to(accelerator.device)
@@ -338,10 +359,10 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
             decoded_contact_output = accelerator.gather(decoded_contact_output.to(accelerator.device)).cpu()
             decoded_contact_gtruth = accelerator.gather(decoded_contact_gtruth.to(accelerator.device)).cpu()
 
-        # Check if we have joint angles
-        has_joints = "joint_angles" in batch and joint_outputs is not None
+        # Use full GT labels (not the masked input) for joint angle visualization (mode 0/1 only)
+        has_joints = want_joints and "joint_angle_labels" in batch and joint_outputs is not None
         if has_joints:
-            gt_joints_all = batch["joint_angles"][:4].cpu()  # (B, T, 4)
+            gt_joints_all = batch["joint_angle_labels"][:4].cpu()  # (B, T, 4) — full GT
             pred_joints_all = joint_outputs.cpu()  # (B, num_future, 4)
 
         if accelerator.is_main_process:
@@ -458,13 +479,12 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
                 metrics["ar_contact_lpips"].extend(compute_lpips(decoded_contact_gtruth,
                                                                  decoded_contact_output, lpips_alex))
             
-            # Compute joint angle MSE if available
-            if "joint_angles" in batch and joint_outputs is not None:
-                gt_joints = batch["joint_angles"][:4].to(accelerator.device)
+            # Compute joint angle MSE using full GT labels (mode 0/1 only)
+            if want_joints and "joint_angle_labels" in batch and joint_outputs is not None:
+                gt_joints = batch["joint_angle_labels"][:4].to(accelerator.device)
                 gt_joints_future = gt_joints[:, num_prompt_frames:]  # (B, num_future, 4)
                 pred_joints = joint_outputs.to(accelerator.device)  # (B, num_future, 4)
                 
-                # MSE per example
                 joint_mse = ((pred_joints - gt_joints_future) ** 2).mean(dim=(1, 2))  # (B,)
                 metrics["ar_joint_mse"].extend(joint_mse.cpu().tolist())
 
@@ -575,6 +595,7 @@ def main():
         config.image_vocab_size = vocab_size
         config.T = args.window_size
         config.S = latent_side_len**2
+        config.mode = args.mode
         model = STMaskGIT(config)
 
         if args.mu_transfer:

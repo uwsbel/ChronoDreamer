@@ -228,20 +228,25 @@ def get_maskgit_collator(config: GenieConfig):
         x_THW = unfactorize_token_ids(x_THWC, config.num_factored_vocabs, config.factored_vocab_size)
         x_THW[:, first_masked_frame:][mask] = mask_token_id
 
-        # Split actions into history and future
-        history_actions = actions[:, :first_masked_frame, :]  # shape: (batch, num_prompt_frames, 3)
-        future_actions = actions[:, first_masked_frame:, :]   # shape: (batch, num_future_frames, 3)
-
-        # Pass full contact sequence - loss will be computed only on masked positions
-        # (no need to slice here, the model handles it via relevant_mask)
-
-        return {
+        result = {
             "input_ids": rearrange(x_THW, "b t h w -> b (t h w)"),
             "labels": rearrange(labels, "b t h w -> b (t h w)"),
-            "contact_labels": rearrange(contact_THW, "b t h w -> b (t h w)"),
-            "actions": actions,  # Full sequence (B, T, 3)
-            "joint_angles": joint_angles,  # Full sequence (B, T, 4)
+            "actions": actions,
             "first_masked_frame": first_masked_frame,
         }
+
+        # Contact labels — only in mode 0
+        if config.mode == 0:
+            result["contact_labels"] = rearrange(contact_THW, "b t h w -> b (t h w)")
+
+        # Joint angles — only in mode 0 and 1
+        if config.mode <= 1:
+            joint_angle_labels = joint_angles.clone()
+            masked_joint_angles = joint_angles.clone()
+            masked_joint_angles[:, first_masked_frame:] = 0.0
+            result["joint_angles"] = masked_joint_angles
+            result["joint_angle_labels"] = joint_angle_labels
+
+        return result
 
     return collate_fn

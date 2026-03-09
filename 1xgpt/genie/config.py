@@ -15,6 +15,9 @@ class GenieConfig:
     # actual model vocab size is larger to include special (e.g. mask) tokens.
     use_mup: bool = False
 
+    # Training mode: 0=full (video+contact+joints), 1=no contact, 2=video only
+    mode: int = 0
+
     # Contact prediction
     contact_vocab_size: int = 65536  # vocab size for contact tokens (adjust if different)
     contact_loss_weight: float = 2.0  # weight for contact prediction loss

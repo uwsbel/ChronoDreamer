@@ -116,7 +116,7 @@ def main():
     assert example_actions.shape[1] == args.window_size, \
         f"Actions length {example_actions.shape[1]} != window_size {args.window_size}"
     
-    # Joint angles: (1, T, 4) - includes both history and future joint angles
+    # Joint angles: (1, T, 4) — full GT, will be split into history (input) and future (GT comparison)
     if "joint_angles" in example_data:
         example_joint_angles = example_data["joint_angles"].unsqueeze(0).to("cuda")
     else:
@@ -125,34 +125,43 @@ def main():
     # Load the model checkpoint
     model = STMaskGIT.from_pretrained(args.checkpoint_dir).to("cuda")
     model.eval()
+    mode = model.config.mode
+
+    # Warn and override flags incompatible with model mode
+    if mode >= 1 and args.generate_contact:
+        print(f"WARNING: Model was trained with mode={mode}, contact head not available. Skipping --generate_contact.")
+        args.generate_contact = False
+    if mode >= 2 and args.generate_joints:
+        print(f"WARNING: Model was trained with mode={mode}, joint head not available. Skipping --generate_joints.")
+        args.generate_joints = False
+
+    # Zero out future joint angles (only needed in mode 0/1)
+    if mode <= 1 and example_joint_angles is not None:
+        masked_joint_angles = example_joint_angles.clone()
+        masked_joint_angles[:, args.num_prompt_frames:] = 0.0
+    else:
+        masked_joint_angles = None
     
-    print(f"Generating with:")
+    print(f"Generating with (mode={mode}):")
     print(f"  - History frames: 0..{args.num_prompt_frames - 1} (history_actions from same frames)")
     print(f"  - Future frames to predict: {args.num_prompt_frames}..{args.window_size - 1}")
     print(f"  - Future actions (conditioning): frames {args.num_prompt_frames}..{args.window_size - 1}")
     print(f"  - Stride: {args.stride} (effective Hz: {val_dataset.metadata.get('hz', 30) / args.stride:.1f})")
 
-    # Initialize prompt: history frames visible, future frames masked
     prompt_THW = example_THW.clone()
     prompt_THW[:, args.num_prompt_frames:] = model.mask_token_id
 
-    # Generate future frames one at a time
     samples = []
     for timestep in range(args.num_prompt_frames, args.window_size):
-        # Teacher-forced: reset to ground truth for frames before current timestep
         if args.teacher_force_time:
             prompt_THW = example_THW.clone()
             prompt_THW[:, timestep:] = model.mask_token_id
 
-        # Generate frame at timestep using:
-        #   - prompt_THW: history video + previously generated frames (or GT if teacher forcing)
-        #   - example_actions: full action sequence (history + future)
-        #   - example_joint_angles: full joint angle sequence (history + future)
         samples_HW, _ = model.maskgit_generate(
             prompt_THW,
             out_t=timestep,
-            actions=example_actions,  # Full actions: (B, T, 3)
-            joint_angles=example_joint_angles,  # Full joint angles: (B, T, 4)
+            actions=example_actions,
+            joint_angles=masked_joint_angles,  # History only, future zeroed
             maskgit_steps=args.maskgit_steps,
             temperature=args.temperature,
         )
@@ -197,13 +206,10 @@ def main():
             predicted_future,                          # Predicted future frames
         ], dim=1)
         
-        # Generate contact tokens for future frames
-        # Input: predicted_video (B, T, H, W) + full actions (B, T, 3) + joint angles (B, T, 4)
-        # Output: contact tokens for frames num_prompt_frames..window_size-1
         contact_tokens = model.generate_contact(
             predicted_video,
             actions=example_actions,
-            joint_angles=example_joint_angles,
+            joint_angles=masked_joint_angles,  # History only, future zeroed
             num_prompt_frames=args.num_prompt_frames,
             temperature=args.temperature,
         )
@@ -233,11 +239,10 @@ def main():
             predicted_future,                          # Predicted future frames
         ], dim=1)
         
-        # Generate joint angle predictions for future frames
         pred_joints = model.generate_joints(
             predicted_video,
             actions=example_actions,
-            joint_angles=example_joint_angles,
+            joint_angles=masked_joint_angles,  # History only, future zeroed
             num_prompt_frames=args.num_prompt_frames,
         )
         
