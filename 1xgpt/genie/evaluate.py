@@ -14,6 +14,8 @@ Example usage:
     python genie/evaluate.py --checkpoint_dir data/genie_model/step_700000 --val_data_dir data/val_v3.0
     python genie/evaluate.py --checkpoint_dir data/genie_model/step_700000 --val_data_dir data/val_v3.0 --evaluate_contact
     python genie/evaluate.py --checkpoint_dir data/genie_model/step_700000 --val_data_dir data/val_v3.0 --evaluate_joints
+    python genie/evaluate.py ... -n 500 --random_sample_seed 0
+    python genie/evaluate.py ... --shuffle_eval --max_examples 200
 """
 
 import argparse
@@ -94,6 +96,24 @@ def parse_args():
     parser.add_argument(
         "--max_examples", type=int,
         help="If specified, will stop evaluation early after `max_examples` examples."
+    )
+    parser.add_argument(
+        "-n",
+        "--random_sample_n",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Evaluate on N validation windows drawn uniformly without replacement "
+        "(ignores --max_examples). Shorthand: -n N. Use --random_sample_seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--shuffle_eval", action="store_true",
+        help="Randomly permute all validation windows before applying --max_examples. "
+        "Ignored if --random_sample_n is set.",
+    )
+    parser.add_argument(
+        "--random_sample_seed", type=int, default=42,
+        help="Seed for numpy sampling (--random_sample_n / --shuffle_eval) and transformers.set_seed in main.",
     )
     parser.add_argument(
         "--teacher_force_time", action="store_true",
@@ -342,8 +362,8 @@ def compute_future_frame_loss(
 
 @torch.no_grad()
 def main():
-    transformers.set_seed(42)
     args = parse_args()
+    transformers.set_seed(args.random_sample_seed)
 
     print(f"=" * 60)
     print(f"GENIE Evaluation")
@@ -356,6 +376,11 @@ def main():
     print(f"Teacher forcing: {args.teacher_force_time}")
     print(f"Evaluate contact: {args.evaluate_contact}")
     print(f"Evaluate joints: {args.evaluate_joints}")
+    print(f"Random sample seed: {args.random_sample_seed}")
+    print(
+        f"random_sample_n: {args.random_sample_n}, shuffle_eval: {args.shuffle_eval}, "
+        f"max_examples: {args.max_examples}"
+    )
     print(f"=" * 60)
 
     # Load dataset
@@ -378,10 +403,30 @@ def main():
     if args.evaluate_joints and not has_joint_data:
         print("WARNING: --evaluate_joints specified but no joint angles data found. Skipping joint evaluation.")
         args.evaluate_joints = False
-    
-    if args.max_examples is not None:
-        val_dataset.valid_start_inds = val_dataset.valid_start_inds[:args.max_examples]
-        print(f"Limiting evaluation to {args.max_examples} examples")
+
+    n_val = len(val_dataset.valid_start_inds)
+    print(f"Validation pool: {n_val} windows (after filter_overlaps).")
+    if args.random_sample_n is None:
+        print("Sampling: using full pool (pass -n / --random_sample_n to subsample randomly).")
+    if args.random_sample_n is not None:
+        if args.max_examples is not None:
+            print("WARNING: --max_examples ignored when --random_sample_n is set.")
+        if args.shuffle_eval:
+            print("WARNING: --shuffle_eval ignored when --random_sample_n is set.")
+        rng = np.random.default_rng(args.random_sample_seed)
+        n = min(args.random_sample_n, n_val)
+        pick = rng.choice(n_val, size=n, replace=False)
+        val_dataset.valid_start_inds = [val_dataset.valid_start_inds[i] for i in pick]
+        print(f"Randomly sampled {n} / {n_val} validation windows (seed={args.random_sample_seed}).")
+    else:
+        if args.shuffle_eval:
+            rng = np.random.default_rng(args.random_sample_seed)
+            order = rng.permutation(n_val)
+            val_dataset.valid_start_inds = [val_dataset.valid_start_inds[i] for i in order]
+            print(f"Shuffled evaluation order over {n_val} windows (seed={args.random_sample_seed}).")
+        if args.max_examples is not None:
+            val_dataset.valid_start_inds = val_dataset.valid_start_inds[: args.max_examples]
+            print(f"Limiting evaluation to {len(val_dataset)} examples")
 
     # Load model and create dataloader with proper collator
     model = STMaskGIT.from_pretrained(args.checkpoint_dir)
