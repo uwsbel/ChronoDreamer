@@ -100,6 +100,12 @@ def parse_args():
                              "Default: 50 (2 seconds at 25fps).")
     parser.add_argument("--skip_labeled", action="store_true",
                         help="Skip samples that already have a label.")
+    parser.add_argument("--inference_only", action="store_true",
+                        help="Run inference on all samples and save artifacts, "
+                             "but do not launch the labeling UI or produce collision_labels.json.")
+    parser.add_argument("--inference_future_only", action="store_true",
+                        help="Like --inference_only but only produce future frames "
+                             "(no context frames) and only future GIFs (no full GIFs).")
     return parser.parse_args()
 
 
@@ -301,7 +307,8 @@ def make_sidebyside_raw_gif(video_array, contact_array, start, end,
 
 @torch.no_grad()
 def generate_sample_artifacts(
-    entry, registry, models, decode_latents, args, output_dir
+    entry, registry, models, decode_latents, args, output_dir,
+    future_only=False,
 ):
     """
     Generate and save all artifacts for one sample:
@@ -323,8 +330,9 @@ def generate_sample_artifacts(
     gif_dir = sample_dir / "gif"
     gif_dir.mkdir(parents=True, exist_ok=True)
 
-    gt_path = sample_dir / "gt.png"
-    gt_contact_path = sample_dir / "gt_contact.png"
+    suffix = "_future_only" if future_only else ""
+    gt_path = sample_dir / f"gt{suffix}.png"
+    gt_contact_path = sample_dir / f"gt_contact{suffix}.png"
     gif_path = gif_dir / "gt_future_stride1.gif"
 
     has_contact = ds.contact is not None
@@ -335,7 +343,7 @@ def generate_sample_artifacts(
     if has_contact:
         expected.append(gt_contact_path)
     for ml in models:
-        expected.append(sample_dir / f"{ml}.png")
+        expected.append(sample_dir / f"{ml}{suffix}.png")
     if all(p.exists() for p in expected):
         return str(gt_path), gt_contact_result, str(gif_path)
 
@@ -367,21 +375,32 @@ def generate_sample_artifacts(
 
     # --- GT video-only comic strip ---
     if not gt_path.exists():
-        save_comic_strip([gt_video_pil], [("Context", "Future")],
-                         args.window_size, str(gt_path))
+        if future_only:
+            save_comic_strip([gt_video_pil[npf:]], [("Future", "Future")],
+                             args.window_size - npf, str(gt_path))
+        else:
+            save_comic_strip([gt_video_pil], [("Context", "Future")],
+                             args.window_size, str(gt_path))
 
     # --- GT video + contact comic strip ---
     if has_contact and not gt_contact_path.exists():
-        save_comic_strip(
-            [gt_video_pil, gt_contact_pil],
-            [("Context", "Future"), ("Contact Context", "Contact Future")],
-            args.window_size, str(gt_contact_path),
-        )
+        if future_only:
+            save_comic_strip(
+                [gt_video_pil[npf:], gt_contact_pil[npf:]],
+                [("Future", "Future"), ("Contact Future", "Contact Future")],
+                args.window_size - npf, str(gt_contact_path),
+            )
+        else:
+            save_comic_strip(
+                [gt_video_pil, gt_contact_pil],
+                [("Context", "Future"), ("Contact Context", "Contact Future")],
+                args.window_size, str(gt_contact_path),
+            )
 
     # --- Model predictions (saved silently, not shown) ---
     pred_pil_cache = {}
     for model_label, model in models.items():
-        pred_path = sample_dir / f"{model_label}.png"
+        pred_path = sample_dir / f"{model_label}{suffix}.png"
 
         mode = model.config.mode
         pred_future = generate_video_predictions(
@@ -403,11 +422,23 @@ def generate_sample_artifacts(
                 contact_THW[:, :npf], pred_contact
             ], dim=1)
             pred_contact_pil = decode_tokens_to_pil(full_pred_contact, decode_latents)
-            pred_rows.append(pred_contact_pil)
-            pred_labels.append(("Contact Context", "Contact Future"))
+            if future_only:
+                pred_rows.append(pred_contact_pil[npf:])
+                pred_labels.append(("Contact Future", "Contact Future"))
+            else:
+                pred_rows.append(pred_contact_pil)
+                pred_labels.append(("Contact Context", "Contact Future"))
 
         if not pred_path.exists():
-            save_comic_strip(pred_rows, pred_labels, args.window_size, str(pred_path))
+            if future_only:
+                # Only future frames for video row too
+                save_comic_strip(
+                    [pred_video_pil[npf:]] + pred_rows[1:],
+                    [("Future", "Future")] + pred_labels[1:],
+                    args.window_size - npf, str(pred_path),
+                )
+            else:
+                save_comic_strip(pred_rows, pred_labels, args.window_size, str(pred_path))
 
         pred_pil_cache[model_label] = {
             "video": pred_video_pil,
@@ -418,25 +449,29 @@ def generate_sample_artifacts(
     # GT video: stride-1
     make_raw_gif(ds.data, future_start, future_end, decode_latents,
                  str(gif_dir / "gt_future_stride1.gif"))
-    make_raw_gif(ds.data, start_frame, future_end, decode_latents,
-                 str(gif_dir / "gt_full_stride1.gif"))
     # GT video: stride-15
     make_pil_gif(gt_video_pil[npf:], str(gif_dir / "gt_future_stride15.gif"))
-    make_pil_gif(gt_video_pil, str(gif_dir / "gt_full_stride15.gif"))
+
+    if not future_only:
+        make_raw_gif(ds.data, start_frame, future_end, decode_latents,
+                     str(gif_dir / "gt_full_stride1.gif"))
+        make_pil_gif(gt_video_pil, str(gif_dir / "gt_full_stride15.gif"))
 
     if has_contact:
         # GT contact (side-by-side video+contact): stride-1
         make_sidebyside_raw_gif(ds.data, ds.contact, future_start, future_end,
                                 decode_latents, str(gif_dir / "gt_contact_future_stride1.gif"))
-        make_sidebyside_raw_gif(ds.data, ds.contact, start_frame, future_end,
-                                decode_latents, str(gif_dir / "gt_contact_full_stride1.gif"))
         # GT contact (side-by-side video+contact): stride-15
         sbs_future = [make_sidebyside_frame(v, c)
                       for v, c in zip(gt_video_pil[npf:], gt_contact_pil[npf:])]
         make_pil_gif(sbs_future, str(gif_dir / "gt_contact_future_stride15.gif"))
-        sbs_full = [make_sidebyside_frame(v, c)
-                    for v, c in zip(gt_video_pil, gt_contact_pil)]
-        make_pil_gif(sbs_full, str(gif_dir / "gt_contact_full_stride15.gif"))
+
+        if not future_only:
+            make_sidebyside_raw_gif(ds.data, ds.contact, start_frame, future_end,
+                                    decode_latents, str(gif_dir / "gt_contact_full_stride1.gif"))
+            sbs_full = [make_sidebyside_frame(v, c)
+                        for v, c in zip(gt_video_pil, gt_contact_pil)]
+            make_pil_gif(sbs_full, str(gif_dir / "gt_contact_full_stride15.gif"))
 
     # Prediction GIFs (stride-15 only)
     for model_label, cached in pred_pil_cache.items():
@@ -449,18 +484,20 @@ def generate_sample_artifacts(
                        for v, c in zip(pv[npf:], pc[npf:])]
             make_pil_gif(sbs_fut, str(gif_dir / f"{model_label}_future.gif"))
 
-            sbs_all = [make_sidebyside_frame(v, c)
-                       for v, c in zip(pv, pc)]
-            labeled = ([label_frame(f, "Context") for f in sbs_all[:npf]]
-                       + [label_frame(f, "Future") for f in sbs_all[npf:]])
-            make_pil_gif(labeled, str(gif_dir / f"{model_label}_full.gif"))
+            if not future_only:
+                sbs_all = [make_sidebyside_frame(v, c)
+                           for v, c in zip(pv, pc)]
+                labeled = ([label_frame(f, "Context") for f in sbs_all[:npf]]
+                           + [label_frame(f, "Future") for f in sbs_all[npf:]])
+                make_pil_gif(labeled, str(gif_dir / f"{model_label}_full.gif"))
         else:
             # Mode 1: video only
             make_pil_gif(pv[npf:], str(gif_dir / f"{model_label}_future.gif"))
 
-            labeled = ([label_frame(f, "Context") for f in pv[:npf]]
-                       + [label_frame(f, "Future") for f in pv[npf:]])
-            make_pil_gif(labeled, str(gif_dir / f"{model_label}_full.gif"))
+            if not future_only:
+                labeled = ([label_frame(f, "Context") for f in pv[:npf]]
+                           + [label_frame(f, "Future") for f in pv[npf:]])
+                make_pil_gif(labeled, str(gif_dir / f"{model_label}_full.gif"))
 
     return str(gt_path), gt_contact_result, str(gif_path)
 
@@ -647,6 +684,22 @@ def main():
     # Init decoder
     print("\nInitializing Cosmos decoder ...")
     decode_latents = decode_latents_wrapper()
+
+    # Inference-only mode: generate all artifacts then exit
+    if args.inference_only or args.inference_future_only:
+        future_only = args.inference_future_only
+        mode_label = "inference-future-only" if future_only else "inference-only"
+        total = len(registry)
+        print(f"\n{mode_label} mode: generating artifacts for {total} samples ...")
+        for i in range(total):
+            entry = registry.get_entry(i)
+            print(f"  [{i + 1}/{total}] {entry['uid']}")
+            generate_sample_artifacts(
+                entry, registry, models, decode_latents, args, args.output_dir,
+                future_only=future_only,
+            )
+        print(f"\nDone. Artifacts saved under {args.output_dir}/samples/")
+        return
 
     # Load existing labels
     labels_data = load_labels(labels_path)
