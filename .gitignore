@@ -17,3 +17,12 @@ venv/
 1xgpt/venv/
 1xgpt/wandb/
 human-label/output/
+dreamer/data/genie_model/
+dreamer/data/genie-test/
+dreamer/data/genie_generated/
+dreamer/data/pretrained_ckpts/
+dreamer/data/test*
+dreamer/data/train*
+dreamer/data/val*
+dreamer/venv/
+dreamer/wandb/
