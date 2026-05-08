@@ -16,3 +16,4 @@ test-scripts/vid-model/pretrained_ckpts/
 venv/
 1xgpt/venv/
 1xgpt/wandb/
+human-label/output/
