@@ -7,6 +7,9 @@ viewer: false
 ---
 
 # 1X World Model Compression Challenge Dataset
+
+> **Note for ChronoDreamer.** ChronoDreamer trains on the [DreamerBench dataset](https://huggingface.co/datasets/zzhou292/DreamerBench), not the 1X data described below. The loaders in this folder (`cosmos_video_decoder.py`, `unpack_data_*.py`) and the Cosmos-tokenized `.bin` layout are reused from 1X's original challenge, so the format notes still apply, but the robot and joint definitions here are 1X's EVE robot rather than our Robotiq pushing setup.
+
 This repository hosts the dataset for the [1X World Model Compression Challenge](https://huggingface.co/spaces/1x-technologies/1X_World_Model_Challenge_Compression).
 
 ```bash

@@ -1,107 +1,85 @@
-A world model training framework upon Chrono
-# ChronoDreamer World Model & Robotics Framework
+# ChronoDreamer
 
-This repository provides a comprehensive framework for world model training, video tokenization, and robotics simulation, integrating state-of-the-art generative models and physical simulation environments.
-<img width="4800" height="2400" alt="media_images_vis_train_0_217000_206c6109eb0c8f29c237" src="https://github.com/user-attachments/assets/16793f01-b350-4074-967b-7b4845f6de27" />
+ChronoDreamer is the code for our work on action-conditioned world models for contact-rich robotic manipulation. The model watches a short clip from the robot's cameras, and given the actions the arm is about to take, it predicts what comes next: the future video frames, a contact map, and the arm's joint angles. Everything is trained on pushing and striking trajectories simulated in [Project Chrono](https://projectchrono.org/) and released as the [DreamerBench dataset](https://huggingface.co/datasets/zzhou292/DreamerBench).
 
-![generated_offset0(1)](https://github.com/user-attachments/assets/395be1c5-6c9f-4f3a-b93c-3a5548606722)
+<img width="4800" height="2400" alt="ChronoDreamer training visualization" src="https://github.com/user-attachments/assets/16793f01-b350-4074-967b-7b4845f6de27" />
 
+![A predicted rollout](https://github.com/user-attachments/assets/395be1c5-6c9f-4f3a-b93c-3a5548606722)
 
-## Repository Structure
+## What's in here
 
-- **1xgpt/**  
-  Implementation of GENIE (spatio-temporal transformer and MaskGIT sampler), world model compression challenge scripts, and utilities.
-  - `train.py`, `visualize.py`, `test_attention.py`: Model training, visualization, and testing.
-  - `data/`: Dataset scripts and documentation.
-  - `genie/`: GENIE model code.
-  - `magvit2/`: MAGVIT2 encoder/decoder utilities.
+The repo follows the three stages of the project, so each top-level folder is one stage:
 
-- **test-scripts/vid-model/**  
-  Video model scripts, Cosmos-Tokenizer integration, and pre-trained checkpoints.
-  - `Cosmos-Tokenizer/`: NVIDIA Cosmos Tokenizer code and documentation.
-  - `pretrained_ckpts/`: Pre-trained Cosmos Tokenizer models.
-  - `1xgpt_cosmos_vid_endecoder.ipynb`: Example notebook for video encoding/decoding.
+- **`PyChronobotics-main/`** — the Chrono simulation that generates the data. A Robotiq gripper is driven around a tabletop with Ornstein–Uhlenbeck joystick noise so that it keeps running into things, and we log RGB from a few cameras, joint angles, the action commands, and the per-contact forces. The relevant scripts are in `experiment/`, mainly `jz_robotiq_push_contact*.py` (and `jz_robotiq_push_ou.py` for the OU excitation).
+- **`dreamer/`** — the world model itself. A spatial-temporal transformer trained with a MaskGIT-style masked-token objective on Cosmos image tokens. Training, sampling, visualization, and running the model on a simulated episode all live here.
+- **`human-label/`** — the VLM-AUC evaluation. `label_collisions.py` is the small UI we used to mark whether a clip actually contains a collision, and `vlm_evaluate.py` runs vision-language judges and scores them against those labels.
 
-- **PyChronobotics-main/**  
-  Robotics simulation and control using PyChrono.
-  - `experiment/`: Example scripts for robot control and simulation.
-  - `models/`: Robot models (e.g., Jackal, robot arm).
-  - `data/`: 3D assets and robot assembly files.
-  - `util/`: Utilities for kinematics and asset import.
+`dreamer/cosmos/` and `dreamer/magvit2/` are vendored tokenizers (NVIDIA Cosmos and Open-MAGVIT2). You don't normally need to touch them.
 
-## Getting Started
+## Setup
 
-### Requirements
-
-- Python 3.10+
-- [PyTorch](https://pytorch.org/)
-- [PyChrono](https://projectchrono.org/)
-- [ffmpeg](https://ffmpeg.org/) (for video processing)
-- Additional dependencies listed in `requirements.txt` files.
-
-### Installation
-
-1. **Install dependencies and download data:**
-    ```sh
-    cd 1xgpt
-    ./build.sh
-    source venv/bin/activate
-    ```
-
-2. **Install Cosmos-Tokenizer (Linux recommended):**
-    ```sh
-    git clone https://github.com/NVIDIA/Cosmos-Tokenizer.git
-    cd Cosmos-Tokenizer
-    pip3 install -r requirements.txt
-    apt-get install -y ffmpeg
-    ```
-
-3. **(Optional) Build Docker image for Cosmos-Tokenizer:**
-    ```sh
-    docker build -t cosmos-tokenizer -f Dockerfile .
-    docker run --gpus all -it --rm -v /home/${USER}:/home/${USER} \
-        --workdir ${PWD} cosmos-tokenizer /bin/bash
-    ```
-
-## Usage
-
-### Train GENIE Model
+You need Python 3.10 (tested on 3.10.12) and a CUDA GPU. From `dreamer/`:
 
 ```sh
-python train.py --genie_config genie/configs/magvit_n32_h8_d256.json --output_dir data/genie_model --max_eval_steps 10
+cd dreamer
+./build.sh
+source venv/bin/activate
 ```
 
-### Generate and Visualize
+`build.sh` makes a virtualenv, installs `requirements.txt`, and builds flash-attn. On newer (sm_120) cards use `build-sm120.sh` with `requirements-sm120.txt` instead. Image tokenization runs through the Cosmos tokenizer in `dreamer/cosmos/`, whose weights download on first use.
+
+## How to run it
+
+The stages run in order, but if you just want to train, grab DreamerBench and skip straight to step 2.
+
+**1. Generate data (optional).** From `PyChronobotics-main/experiment/`:
 
 ```sh
-python genie/generate.py --checkpoint_dir data/genie_model/final_checkpt
-python visualize.py --token_dir data/genie_generated
+python3 jz_robotiq_push_contact.py --output-dir test_run
 ```
 
-### Evaluate
+`run_sample.sh` just loops that and compresses the rendered frames to JPEG.
+
+**2. Train the world model.** From `dreamer/`:
 
 ```sh
-python genie/evaluate.py --checkpoint_dir data/genie_model/final_checkpt
+python train.py --genie_config genie/configs/magvit_n32_h8_d256.json \
+    --output_dir data/genie_model
 ```
 
-### Video Tokenization (Cosmos-Tokenizer)
+Configs are in `genie/configs/`; `python train.py --help` lists the rest of the knobs.
 
-See [test-scripts/vid-model/Cosmos-Tokenizer/README.md](test-scripts/vid-model/Cosmos-Tokenizer/README.md) for details and API usage.
+**3. Predict and visualize a rollout** (camera plus contact):
 
-## Dataset
+```sh
+python genie/generate.py --checkpoint_dir data/genie_model/<ckpt> \
+    --val_data_dir data/generate_test --example_ind 100 --generate_contact
+python visualize.py --token_dir data/genie_generated --visualize_contact
+```
 
-- **1X World Model Compression Challenge Dataset**  
-  See [1xgpt/data/README.md](1xgpt/data/README.md) for dataset details, structure, and usage scripts.
+`sample.sh` batches those two over a range of clips. To run the model on one specific simulated episode (frames, actions, and joint angles already on disk), use `inference_from_sim.py`.
 
-## Citation
+**4. Evaluate with VLM-AUC.** From `human-label/`, label a few clips and then score a judge against them:
 
-If you use this repository, please cite the relevant papers and repositories as described in [1xgpt/README.md](1xgpt/README.md) and [test-scripts/vid-model/Cosmos-Tokenizer/README.md](test-scripts/vid-model/Cosmos-Tokenizer/README.md).
+```sh
+python label_collisions.py
+python vlm_evaluate.py --backend nvidia --api_key $NVIDIA_API_KEY --data_dir output_pilot
+```
+
+The judges are open-weight VLMs (we used Llama 3.2 90B, Gemma 3 27B, and Qwen3.5 122B). The `prompts*.py` files hold the prompt variants we average over.
+
+## Data
+
+DreamerBench is on the Hub: <https://huggingface.co/datasets/zzhou292/DreamerBench>. It contains the raw RGB, contact-splat, proprioception, action, and physics arrays for each scenario, plus precomputed Cosmos DI8×8 tokens so you can train in token space without re-encoding. It's large, so pull the scenario you need rather than the whole thing.
+
+## Acknowledgements
+
+The transformer and MaskGIT sampler in `dreamer/` started from 1X Technologies' GENIE baseline ([1xgpt](https://github.com/1x-technologies/1xgpt)) — thanks to them for releasing it. Tokenization uses NVIDIA's [Cosmos Tokenizer](https://github.com/NVIDIA/Cosmos-Tokenizer), and the older MAGVIT2 path comes from [Open-MAGVIT2](https://github.com/TencentARC/Open-MAGVIT2).
+
+## Citing
+
+If this code or DreamerBench is useful in your research, please cite the ChronoDreamer paper (Zhou and Negrut) and the DreamerBench dataset.
 
 ## License
 
-- Code: [Apache 2.0](1xgpt/LICENSE)
-- Cosmos-Tokenizer Models: [NVIDIA Open Model License](https://developer.download.nvidia.com/licenses/nvidia-open-model-license-agreement-june-2024.pdf)
-
----
-
-For more details, see individual module READMEs and documentation.
+The code is Apache-2.0 (see `dreamer/LICENSE`). The Cosmos tokenizer weights are covered by the [NVIDIA Open Model License](https://developer.download.nvidia.com/licenses/nvidia-open-model-license-agreement-june-2024.pdf).
